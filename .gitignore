@@ -1,6 +1,8 @@
 /.tag
 .DS_Store
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/worktrees/
 dhat-heap.json
 /docs/_site
 /docs/favicon.png
