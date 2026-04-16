@@ -8,6 +8,7 @@ use wezterm_term::{TerminalConfiguration, TerminalSize};
 
 pub mod confirm;
 pub mod confirm_close_pane;
+pub mod context_dropdowns;
 pub mod copy;
 pub mod debug;
 pub mod launcher;

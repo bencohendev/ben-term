@@ -435,6 +435,14 @@ pub struct Config {
     #[dynamic(default = "default_num_alphabet")]
     pub launcher_alphabet: String,
 
+    // Context dropdowns (ben-term custom) — v1: cd picker
+    #[dynamic(default = "default_true")]
+    pub cd_picker_enabled: bool,
+    #[dynamic(default = "default_cd_picker_max_depth")]
+    pub cd_picker_max_depth: u8,
+    #[dynamic(default = "default_true")]
+    pub cd_picker_include_home: bool,
+
     #[dynamic(default)]
     pub disable_default_quick_select_patterns: bool,
     #[dynamic(default)]
@@ -1860,6 +1868,10 @@ fn default_num_alphabet() -> String {
 
 fn default_alphabet() -> String {
     "asdfqwerzxcvjklmiuopghtybn".to_string()
+}
+
+fn default_cd_picker_max_depth() -> u8 {
+    5
 }
 
 fn default_word_boundary() -> String {

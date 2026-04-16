@@ -3162,6 +3162,22 @@ impl TermWindow {
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
             Confirmation(args) => self.show_confirmation(args),
+            ActivateContextDropdown(kind) => {
+                use config::keyassignment::ContextDropdownKind;
+                let result = match kind {
+                    ContextDropdownKind::Cd => {
+                        crate::overlay::context_dropdowns::cd::try_activate(self, pane)
+                    }
+                };
+                return Ok(match result {
+                    crate::overlay::context_dropdowns::TriggerResult::Launched => {
+                        PerformAssignmentResult::Handled
+                    }
+                    crate::overlay::context_dropdowns::TriggerResult::PassThrough => {
+                        PerformAssignmentResult::Unhandled
+                    }
+                });
+            }
         };
         Ok(PerformAssignmentResult::Handled)
     }
