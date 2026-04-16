@@ -38,12 +38,17 @@ ben-term/
 |---------|------|-------------|
 | WezTerm core | (upstream) | Full terminal emulator: PTY, VT parsing, GPU rendering, tabs, panes, fonts, config |
 
+## Active Features
+
+| Feature | Spec | Description |
+|---------|------|-------------|
+| Context dropdowns | [features/context-dropdowns.md](features/context-dropdowns.md) | Native overlay pickers for cd, git checkout/stash, npm run/cargo, ssh, docker, kill, env — triggered by command + space. v1 in progress: `cd` only |
+
 ## Planned Features
 
 | Feature | Description |
 |---------|-------------|
 | Rich theming | Semantic zones (input/output/error tinting), Claude Code-aware themes, per-project auto-switching, hot-reloadable CSS-like config layer |
-| Context dropdowns | Native overlay pickers for cd, git checkout/stash, npm run/cargo, ssh, docker, kill, env — triggered by command + space |
 | Rich search history | Directory-aware filtering, exit code tracking, timestamps + duration, output preview snippets, frecent ranking |
 | Workspaces & layouts | Named workspaces with pre-configured tab/split layouts, layout persistence across restarts, project-aware tab grouping |
 | Command blocks | Visually group each command + output as a discrete unit — collapsible, copyable, re-runnable |
