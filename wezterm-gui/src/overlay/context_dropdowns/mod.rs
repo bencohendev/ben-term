@@ -10,7 +10,7 @@
 pub mod cd;
 pub mod picker;
 
-use mux::pane::{CachePolicy, Pane};
+use mux::pane::Pane;
 use std::sync::Arc;
 
 /// Outcome of a trigger attempt. Mirrors `PerformAssignmentResult` semantics
@@ -39,16 +39,4 @@ pub fn split_logical_line_at_cursor(pane: &Arc<dyn Pane>) -> Option<(String, Str
     let left = line.logical.columns_as_str(0..lx);
     let right = line.logical.columns_as_str(lx..logical_len);
     Some((left, right))
-}
-
-/// Cheap preflight shared by every context dropdown:
-///   1. Not in an alt-screen TUI (vim / Claude Code / htop).
-///   2. Shell appears to be at a prompt (CWD resolvable via OSC 7 or procinfo).
-///
-/// Specific pickers add their own line-regex check on top of this.
-pub fn at_shell_prompt(pane: &Arc<dyn Pane>) -> bool {
-    if pane.is_alt_screen_active() {
-        return false;
-    }
-    pane.get_current_working_dir(CachePolicy::AllowStale).is_some()
 }

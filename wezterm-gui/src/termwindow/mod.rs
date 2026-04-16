@@ -3402,6 +3402,13 @@ impl TermWindow {
             .and_then(|tab| tab.get_active_pane())
     }
 
+    /// ben-term: helper for context dropdowns to short-circuit when the pane
+    /// already has an overlay mounted (e.g. the picker itself). See
+    /// `overlay/context_dropdowns/`.
+    pub fn pane_has_overlay(&self, pane_id: PaneId) -> bool {
+        self.pane_state(pane_id).overlay.is_some()
+    }
+
     /// Returns a Pane that we can interact with; this will typically be
     /// the active tab for the window, but if the window has a tab-wide
     /// overlay (such as the launcher / tab navigator),

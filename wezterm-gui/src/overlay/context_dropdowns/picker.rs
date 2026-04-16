@@ -208,7 +208,10 @@ pub fn run(mut term: TermWizTerminal, params: PickerParams) -> anyhow::Result<Op
             InputEvent::Key(KeyEvent {
                 key: KeyCode::Char(c),
                 modifiers,
-            }) if modifiers == Modifiers::NONE || modifiers == Modifiers::SHIFT => {
+            }) if !modifiers.contains(Modifiers::CTRL)
+                && !modifiers.contains(Modifiers::ALT)
+                && !modifiers.contains(Modifiers::SUPER) =>
+            {
                 state.filter.push(c);
                 state.update_filter();
             }
