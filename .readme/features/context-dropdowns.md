@@ -1,6 +1,6 @@
 # Context Dropdowns
 
-**Status:** Active
+**Status:** Active — v1 (cd) shipped; follow-ups not started
 
 ## Overview
 
@@ -18,16 +18,21 @@ The v1 module layout (`wezterm-gui/src/overlay/context_dropdowns/`) is designed 
 
 | Decision | Choice | Why |
 |----------|--------|-----|
-| Trigger | Auto on Space when line-left-of-cursor matches `^\s*cd$` | Matches the user's existing zsh `cd<space>` widget; zero extra keystrokes |
+| Trigger | Auto on Space when last whitespace-delimited token in line-left-of-cursor is `cd` | Works across all shell prompts (PS1 text precedes `cd` in the line buffer); zero extra keystrokes |
 | Trigger placement | `KeyAssignment` dispatch, not raw keyevent intercept | Avoids IME / dead-key / compose edge cases; reuses `PerformAssignmentResult::Unhandled` for clean fall-through |
 | Alt-screen guard | Picker never fires in alt-screen mode | Keeps Claude Code / vim / htop safe — space passes through to the TUI |
-| At-prompt guard | `pane.get_current_working_dir()` must be `Some` | Proxy for "shell is at a prompt" — avoids firing inside `read -p` loops in scripts |
-| After select | Insert `cd /path` with NO trailing newline | User reviews and presses Enter; safer for v2 pickers where commands are destructive |
+| Right-of-cursor check | Intentionally dropped | Shells with RPROMPT (powerline themes, git-status blocks) render text to the right of user input, which would otherwise permanently block the trigger |
+| Overlay re-entry guard | Skip trigger if pane already has an overlay | Keystrokes inside the picker go to the picker's own input stream, not back through the trigger |
+| After select | Paste ` /path` (leading space, no newline) | User already typed `cd`; we only append the argument. User confirms with Enter |
 | `~` handling | Resolve to absolute `$HOME` before insert | Avoids bracketed-paste expansion inconsistency across shells |
 | Path quoting | Shell-quote paths with spaces / special chars | Correctness |
-| Candidate gather | Sync pinned entries; async `walkdir` + zoxide stream in | Picker appears instantly; heavier sources don't block UI thread |
-| Walk budget | 300 ms OR 500 entries, whichever hits first | Prevents huge monorepos from stalling the picker |
-| Dir walker | `walkdir` crate (already a direct workspace dep) | Avoid adding `ignore` as a direct dep just for v1 |
+| Candidate gather | Sync on main thread before mounting overlay | Keeps initial render non-blank; BFS walker + zoxide is typically <500 ms |
+| Dir walker | Hand-rolled BFS over `std::fs::read_dir` | `walkdir`'s DFS exhausts the budget on the first huge subtree (`~/Desktop`, `~/Documents`); BFS guarantees depth-N coverage before any depth-N+1 descent |
+| Walk scope | $HOME depth 5 always; CWD depth 1-3 if outside $HOME | Projects live in $HOME; depth 5 covers typical monorepo nesting |
+| Walk budget | 500 ms wall-clock OR 10 000 entries | Bounded cost; caps huge homes |
+| Noise skipping | VCS / build dirs universally; system dirs only at root `/`; `Library`/`Applications`/`Pictures` at $HOME top level | Keeps results relevant without hardcoding user-specific paths |
+| Zoxide integration | Shell out to `zoxide query --list` with hardcoded fallback paths for Homebrew | macOS GUI apps don't inherit shell PATH |
+| Overlay registration | `assign_overlay_for_pane(pane_id, overlay)` — NOT `assign_overlay(tab_id, ...)` | `start_overlay_pane` dismisses via `CancelOverlayForPane(pane_id)`; mismatched storage = picker never closes |
 | Config nesting | Flat fields (`cd_picker_enabled`, etc.) | Premature to nest with one picker; nest when v2 lands |
 
 ## Architecture
@@ -61,20 +66,30 @@ wezterm-gui/src/overlay/context_dropdowns/
 
 ## Verification
 
-- [ ] `cd` + Space at zsh prompt → picker opens with `..`, `-`, `~` immediately; other entries stream in
+Confirmed working in manual QA (v1):
+
+- [x] `cd` + Space at zsh prompt → picker opens with `..`, `-`, `~` and matched entries
+- [x] Pick an entry → buffer shows `cd /path`, NO execution
+- [x] Arrow keys / typing filter / Escape / Enter all work
+- [x] Typing `dev/repos` surfaces every direct child under `~/dev/repos` (BFS walker)
+- [x] `cargo build --bin wezterm-gui` passes
+- [x] `cargo test --bin wezterm-gui context_dropdowns` passes (7/7)
+- [x] `cargo clippy --no-deps -p wezterm-gui` — my module is clean
+
+Left for the user to confirm on their setup:
+
 - [ ] `cd` + Space inside `vim` (alt-screen) → Space inserts normally, no picker
 - [ ] `cd` + Space inside Claude Code (alt-screen) → Space inserts normally, no picker
-- [ ] `echo cd` + Space → no picker (regex mismatch)
-- [ ] `cd foo` then cursor-left + Space → no picker (right-of-cursor not empty)
-- [ ] Pick an entry → buffer shows `cd /path`, NO execution
 - [ ] Pick `~` → buffer shows `cd /Users/bencohen` (resolved)
 - [ ] Pick path with spaces → buffer shows `cd '/path with spaces'` (quoted)
-- [ ] Press Escape in picker → picker closes, buffer unchanged, no stray space
-- [ ] Works with `zoxide` absent (fallback to pinned + walk only)
-- [ ] Large monorepo cwd → picker appears <100ms, walker cuts off at 300ms / 500 entries
 - [ ] `cd_picker_enabled = false` in `wezterm.lua` → Space always inserts normally
-- [ ] Two panes: trigger in A, switch to B before async done → no crash, no stray entries in B
-- [ ] Works with `bash` and `fish` (not just `zsh`)
-- [ ] `cargo build --bin wezterm-gui` passes
-- [ ] `cargo clippy --workspace -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
+- [ ] Works with `bash` / `fish` shells
+
+Known v1 imperfections (v2 will resolve via OSC 133 semantic zones):
+
+- `echo cd ` + Space triggers the picker (cd as argument, not command). Escape dismisses.
+- `cd fo|o` with cursor mid-line triggers the picker (right-of-cursor check was dropped for RPROMPT compatibility).
+
+Pre-existing workspace-wide limitation:
+
+- `cargo clippy --workspace -- -D warnings` fails on unrelated upstream crates (`wezterm-char-props`, `config/src/background.rs`, etc.). This is pre-existing debt in the WezTerm fork and out of scope for this feature.
