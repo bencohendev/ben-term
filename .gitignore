@@ -1,5 +1,6 @@
 /.tag
 .DS_Store
+.claude/settings.local.json
 dhat-heap.json
 /docs/_site
 /docs/favicon.png
