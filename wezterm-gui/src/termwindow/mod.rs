@@ -3162,6 +3162,22 @@ impl TermWindow {
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
             Confirmation(args) => self.show_confirmation(args),
+            ActivateContextDropdown(kind) => {
+                use config::keyassignment::ContextDropdownKind;
+                let result = match kind {
+                    ContextDropdownKind::Cd => {
+                        crate::overlay::context_dropdowns::cd::try_activate(self, pane)
+                    }
+                };
+                return Ok(match result {
+                    crate::overlay::context_dropdowns::TriggerResult::Launched => {
+                        PerformAssignmentResult::Handled
+                    }
+                    crate::overlay::context_dropdowns::TriggerResult::PassThrough => {
+                        PerformAssignmentResult::Unhandled
+                    }
+                });
+            }
         };
         Ok(PerformAssignmentResult::Handled)
     }
@@ -3384,6 +3400,13 @@ impl TermWindow {
         let mux = Mux::get();
         mux.get_active_tab_for_window(self.mux_window_id)
             .and_then(|tab| tab.get_active_pane())
+    }
+
+    /// ben-term: helper for context dropdowns to short-circuit when the pane
+    /// already has an overlay mounted (e.g. the picker itself). See
+    /// `overlay/context_dropdowns/`.
+    pub fn pane_has_overlay(&self, pane_id: PaneId) -> bool {
+        self.pane_state(pane_id).overlay.is_some()
     }
 
     /// Returns a Pane that we can interact with; this will typically be

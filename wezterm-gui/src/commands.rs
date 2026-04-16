@@ -2011,6 +2011,17 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Edit"],
             icon: None,
         },
+        ActivateContextDropdown(ContextDropdownKind::Cd) => CommandDef {
+            brief: "cd picker".into(),
+            doc: "Show fuzzy directory picker when the shell line is `cd`".into(),
+            // Space is the trigger. The assignment handler runs a guard chain
+            // (alt-screen, line regex, at-prompt) and returns Unhandled when
+            // any guard fails, so non-matching contexts get a normal space.
+            keys: vec![(Modifiers::NONE, "Space".into())],
+            args: &[ArgType::ActivePane],
+            menubar: &[],
+            icon: None,
+        },
     })
 }
 
@@ -2054,6 +2065,8 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivateCopyMode,
         ClearKeyTableStack,
         ActivateCommandPalette,
+        // ben-term custom: cd picker on Space (guarded, falls through in alt-screen / non-cd lines)
+        ActivateContextDropdown(ContextDropdownKind::Cd),
         // ----------------- View
         DecreaseFontSize,
         IncreaseFontSize,

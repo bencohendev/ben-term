@@ -531,6 +531,11 @@ fn default_message() -> String {
     "🛑 Really continue?".to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum ContextDropdownKind {
+    Cd,
+}
+
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
 pub enum KeyAssignment {
     SpawnTab(SpawnTabDomain),
@@ -646,6 +651,7 @@ pub enum KeyAssignment {
     PromptInputLine(PromptInputLine),
     InputSelector(InputSelector),
     Confirmation(Confirmation),
+    ActivateContextDropdown(ContextDropdownKind),
 }
 impl_lua_conversion_dynamic!(KeyAssignment);
 
