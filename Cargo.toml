@@ -28,8 +28,11 @@ opt-level = 3
 # debug = 2
 
 [profile.dev]
+# Cuts incremental rebuild + link time substantially; backtraces still resolve
+# to file:line but don't include local variable info.
+debug = "line-tables-only"
 # https://jakedeichert.com/blog/reducing-rust-incremental-compilation-times-on-macos-by-70-percent/
-# Disabled because it breaks builds on Windows
+# macOS already defaults to "unpacked"; Windows breaks if set explicitly.
 #split-debuginfo = "unpacked"
 
 [workspace.dependencies]
