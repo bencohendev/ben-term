@@ -1,6 +1,6 @@
 # Context Dropdowns
 
-**Status:** Active — v1 (cd) shipped; v2 (OSC 133 strict trigger for cd) shipped; follow-ups not started
+**Status:** Active — v1 (cd) shipped; v2 (OSC 133 strict trigger for cd) shipped; v3 (Modal popup rendering for cd) in progress
 
 ## Overview
 
