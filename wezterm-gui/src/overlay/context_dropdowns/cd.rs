@@ -2,7 +2,7 @@
 //!
 //! Guard chain:
 //!   config.cd_picker_enabled → not alt-screen → no existing overlay →
-//!   trigger text check. Two trigger modes:
+//!   no existing modal → trigger text check. Two trigger modes:
 //!   - Strict (OSC 133 Input zone available): first token is `cd` AND
 //!     right-of-cursor within the zone is empty/whitespace.
 //!   - Fallback (no OSC 133): last whitespace-delimited token of the line
@@ -19,15 +19,14 @@
 //! On select, `~` is resolved to the absolute home path before insertion to
 //! avoid bracketed-paste expansion inconsistencies across shells.
 
-use crate::overlay::context_dropdowns::picker::{self, PickerEntry, PickerParams};
+use crate::overlay::context_dropdowns::cd_picker::{CdPicker, PickerEntry};
 use crate::overlay::context_dropdowns::{
     split_input_zone_at_cursor, split_logical_line_at_cursor, TriggerResult,
 };
-use crate::overlay::start_overlay_pane;
 use crate::termwindow::TermWindow;
 use mux::pane::Pane;
-use mux::termwiztermtab::TermWizTerminal;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,9 +34,9 @@ const WALK_BUDGET: Duration = Duration::from_millis(500);
 const WALK_MAX_ENTRIES: usize = 10_000;
 const HOME_WALK_DEPTH: usize = 5;
 
-/// Entry point from `perform_key_assignment`. If every guard passes, launches
-/// the picker as an overlay and returns `Launched` (key consumed). Otherwise
-/// returns `PassThrough` so Space reaches the PTY normally.
+/// Entry point from `perform_key_assignment`. If every guard passes, installs
+/// the picker as a `Modal` popup and returns `Launched` (key consumed).
+/// Otherwise returns `PassThrough` so Space reaches the PTY normally.
 pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> TriggerResult {
     let cfg = config::configuration();
     if !cfg.cd_picker_enabled {
@@ -47,9 +46,14 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
     if pane.is_alt_screen_active() {
         return TriggerResult::PassThrough;
     }
-    // If this pane already has an overlay (e.g. the picker itself), don't
-    // try to re-trigger — let Space through to the overlay's input stream.
+    // If this pane already has an overlay (e.g. copy mode / quickselect),
+    // don't steal Space — let the overlay's input stream consume it.
     if term_window.pane_has_overlay(pane.pane_id()) {
+        return TriggerResult::PassThrough;
+    }
+    // Double-trigger / stacking guard. Incidentally hedges the keystroke
+    // batching bug: duplicate Space events can't spawn a second modal.
+    if term_window.has_modal() {
         return TriggerResult::PassThrough;
     }
 
@@ -85,48 +89,12 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
     let include_home = cfg.cd_picker_include_home;
     let pane_id = pane.pane_id();
 
-    // Gather on the main thread so the picker's first render has content.
-    // Budget-capped BFS walk + zoxide is typically <500 ms.
-    let entries =
-        gather_candidates(cwd.as_deref(), home.as_deref(), max_depth, include_home);
+    // Gather on the main thread so the first render has content. Budget-capped
+    // BFS walk + zoxide is typically <500 ms.
+    let entries = gather_candidates(cwd.as_deref(), home.as_deref(), max_depth, include_home);
 
-    let (overlay, future) = start_overlay_pane(term_window, pane, move |_pid, term| {
-        run_cd_picker(term, entries, pane_id)
-    });
-    // Must use pane-level overlay registration because `start_overlay_pane`
-    // schedules `CancelOverlayForPane(pane_id)` on completion — a tab-level
-    // assignment wouldn't be dismissed by that notification.
-    term_window.assign_overlay_for_pane(pane_id, overlay);
-    promise::spawn::spawn(future).detach();
+    term_window.set_modal(Rc::new(CdPicker::new(entries, pane_id)));
     TriggerResult::Launched
-}
-
-/// Runs on the overlay thread. Gathers candidates (blocking the overlay
-/// thread, not the GUI), then runs the picker loop. On select, paste-injects
-/// the completed `cd <path>` string into the originating pane.
-fn run_cd_picker(
-    term: TermWizTerminal,
-    entries: Vec<PickerEntry>,
-    source_pane_id: mux::pane::PaneId,
-) -> anyhow::Result<()> {
-    let params = PickerParams {
-        title: "cd".to_string(),
-        description: "Select a directory".to_string(),
-        entries,
-        initial_filter: String::new(),
-    };
-    let picked = picker::run(term, params)?;
-    if let Some(entry) = picked {
-        let mux = mux::Mux::get();
-        if let Some(pane) = mux.get_pane(source_pane_id) {
-            // The user already typed `cd` to trigger this picker (Space was
-            // consumed as the trigger). Paste only " <path>" to complete the
-            // command — don't re-emit `cd`.
-            let insertion = format!(" {}", shell_quote(&entry.value));
-            let _ = pane.send_paste(&insertion);
-        }
-    }
-    Ok(())
 }
 
 /// Fallback trigger for shells without OSC 133: fires when the last
@@ -327,7 +295,9 @@ fn dirs_home() -> Option<PathBuf> {
 
 /// Single-quote the path unless it's already safe bare-word shell text.
 /// Embedded `'` is handled via the `'\''` concat trick.
-fn shell_quote(s: &str) -> String {
+///
+/// `pub(super)` so `cd_picker::CdPicker::key_down` can reuse it on Enter.
+pub(super) fn shell_quote(s: &str) -> String {
     let safe = !s.is_empty()
         && s.chars().all(|c| {
             c.is_ascii_alphanumeric()
