@@ -1,13 +1,16 @@
-//! Popup `cd` picker rendered as a `Modal`.
+//! Shared popup picker for context dropdowns, rendered as a `Modal`.
 //!
-//! v3 replacement for the full-pane overlay picker. Reuses the command palette's
-//! paint + input plumbing (zindex 100, `paint_modal` integration, keyevent
-//! dispatch), but does NOT import from `palette.rs` — keeps our divergence
-//! isolated so upstream palette changes don't ripple into here.
+//! Originally shipped as `CdPicker` in v3; generalized to back multiple
+//! pickers (`cd`, `git`, future `npm`/`ssh`/…) that all render the same
+//! anchored, fuzzy-filtered popup and paste a shell-quoted value on Enter.
 //!
-//! The picker body is half-width and top-anchored so the shell prompt and
-//! surrounding output stay visible around it. Trigger + candidate gathering
-//! logic lives in `cd.rs`; this file only owns render and per-keystroke state.
+//! Reuses the command palette's paint + input plumbing (zindex 100,
+//! `paint_modal` integration, keyevent dispatch), but does NOT import from
+//! `palette.rs` — keeps our divergence isolated so upstream palette changes
+//! don't ripple into here.
+//!
+//! Trigger + candidate gathering logic lives in each caller module (e.g.
+//! `cd.rs`, `git.rs`); this file only owns render and per-keystroke state.
 
 use crate::overlay::selector::{matcher_pattern, matcher_score};
 use crate::termwindow::box_model::{
@@ -43,7 +46,7 @@ struct MatchResults {
     matches: Vec<usize>,
 }
 
-pub struct CdPicker {
+pub struct PopupPicker {
     entries: Vec<PickerEntry>,
     source_pane_id: PaneId,
     /// Viewport column of the shell cursor at trigger time (used to anchor
@@ -64,7 +67,7 @@ pub struct CdPicker {
     max_rows_on_screen: RefCell<usize>,
 }
 
-impl CdPicker {
+impl PopupPicker {
     pub fn new(
         entries: Vec<PickerEntry>,
         source_pane_id: PaneId,
@@ -405,7 +408,7 @@ fn compute_matches(selection: &str, entries: &[PickerEntry]) -> Vec<usize> {
     }
 }
 
-impl Modal for CdPicker {
+impl Modal for PopupPicker {
     fn mouse_event(&self, _event: MouseEvent, _term_window: &mut TermWindow) -> anyhow::Result<()> {
         Ok(())
     }
@@ -481,7 +484,7 @@ impl Modal for CdPicker {
                     if let Some(pane) = mux.get_pane(self.source_pane_id) {
                         // User already typed `cd` before Space — only append
                         // the argument. Leading space + shell-quoted path.
-                        let insertion = format!(" {}", super::cd::shell_quote(&value));
+                        let insertion = format!(" {}", super::shell_quote(&value));
                         let _ = pane.send_paste(&insertion);
                     }
                 }
@@ -555,8 +558,8 @@ impl Modal for CdPicker {
 mod tests {
     use super::*;
 
-    fn mk_picker(filter: &str) -> CdPicker {
-        let picker = CdPicker::new(vec![], 0, 0, 0);
+    fn mk_picker(filter: &str) -> PopupPicker {
+        let picker = PopupPicker::new(vec![], 0, 0, 0);
         *picker.selection.borrow_mut() = filter.to_string();
         *picker.filter_cursor.borrow_mut() = filter.len();
         picker
@@ -647,7 +650,7 @@ mod tests {
                 value: "/c".into(),
             },
         ];
-        let picker = CdPicker::new(entries, 0, 0, 0);
+        let picker = PopupPicker::new(entries, 0, 0, 0);
         // Seed an all-pass match list (what `compute_matches("", …)` returns
         // for an empty filter).
         *picker.matches.borrow_mut() = Some(MatchResults {
@@ -666,7 +669,7 @@ mod tests {
 
     #[test]
     fn selected_value_is_none_when_no_matches() {
-        let picker = CdPicker::new(vec![], 0, 0, 0);
+        let picker = PopupPicker::new(vec![], 0, 0, 0);
         *picker.matches.borrow_mut() = Some(MatchResults {
             selection: String::new(),
             matches: vec![],
