@@ -93,7 +93,19 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
     // BFS walk + zoxide is typically <500 ms.
     let entries = gather_candidates(cwd.as_deref(), home.as_deref(), max_depth, include_home);
 
-    term_window.set_modal(Rc::new(CdPicker::new(entries, pane_id)));
+    // Snapshot the cursor's viewport position so the popup can anchor just
+    // below and left-aligned to the typed `cd ` insertion point. Input is
+    // captured while the modal is open, so this snapshot stays valid.
+    let cursor = pane.get_cursor_position();
+    let dims = pane.get_dimensions();
+    let cursor_viewport_row = cursor.y - dims.physical_top;
+
+    term_window.set_modal(Rc::new(CdPicker::new(
+        entries,
+        pane_id,
+        cursor.x,
+        cursor_viewport_row,
+    )));
     TriggerResult::Launched
 }
 

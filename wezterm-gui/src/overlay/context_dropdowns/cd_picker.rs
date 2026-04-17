@@ -46,6 +46,13 @@ struct MatchResults {
 pub struct CdPicker {
     entries: Vec<PickerEntry>,
     source_pane_id: PaneId,
+    /// Viewport column of the shell cursor at trigger time (used to anchor
+    /// the popup just below/left-aligned to the typed `cd ` insertion point).
+    cursor_col: usize,
+    /// Viewport row of the shell cursor at trigger time. Can be negative if
+    /// the cursor is above the visible area, though in practice the picker
+    /// only fires at a live prompt where the cursor is on-screen.
+    cursor_viewport_row: isize,
     // Interior mutability: `Modal` methods take `&self`.
     selection: RefCell<String>,
     /// Byte offset into `selection` where the next insert/delete happens.
@@ -58,10 +65,17 @@ pub struct CdPicker {
 }
 
 impl CdPicker {
-    pub fn new(entries: Vec<PickerEntry>, source_pane_id: PaneId) -> Self {
+    pub fn new(
+        entries: Vec<PickerEntry>,
+        source_pane_id: PaneId,
+        cursor_col: usize,
+        cursor_viewport_row: isize,
+    ) -> Self {
         Self {
             entries,
             source_pane_id,
+            cursor_col,
+            cursor_viewport_row,
             selection: RefCell::new(String::new()),
             filter_cursor: RefCell::new(0),
             selected_row: RefCell::new(0),
@@ -194,8 +208,8 @@ impl CdPicker {
             0.
         };
         let (padding_left, padding_top) = term_window.padding_left_top();
-        let border = term_window.get_os_border();
-        let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
+        let os_border = term_window.get_os_border();
+        let grid_origin_y = top_bar_height + padding_top + os_border.top.get() as f32;
 
         let solid_bg_color: InheritableColor = term_window
             .config
@@ -269,82 +283,85 @@ impl CdPicker {
 
         let dimensions = term_window.dimensions;
         let size = term_window.terminal_size();
+        let cell_w = term_window.render_metrics.cell_size.width as f32;
+        let cell_h = term_window.render_metrics.cell_size.height as f32;
+        let avail_pixel_width = size.cols as f32 * cell_w;
 
-        // Sizing: keep the popup visually slim so the shell prompt and output
-        // remain legible around it. Half the available columns, clamped to
-        // [80, cols] — on narrow windows we fall back to full width.
-        let desired_width = (size.cols / 2).max(80).min(size.cols);
+        // Sizing: narrow popup anchored near the cursor — a dropdown, not a
+        // palette. 50 cols reads comfortably for most paths without dominating
+        // the pane. Clamped to available width on narrow windows.
+        let desired_width_cells = 50_usize.min(size.cols.max(1));
+        let desired_pixel_width = desired_width_cells as f32 * cell_w;
 
-        let avail_pixel_width =
-            size.cols as f32 * term_window.render_metrics.cell_size.width as f32;
-        let desired_pixel_width =
-            desired_width as f32 * term_window.render_metrics.cell_size.width as f32;
+        // Anchor X: left-aligned to the cursor column, but clamped so the
+        // popup doesn't spill off the right edge.
+        let cursor_x_px = padding_left + self.cursor_col as f32 * cell_w;
+        let max_x_px = padding_left + avail_pixel_width - desired_pixel_width;
+        let anchor_x = cursor_x_px.min(max_x_px).max(padding_left);
+
+        // Anchor Y: one row below the cursor row. Negative viewport_row means
+        // the cursor has scrolled above the visible area — rare, but clamp to
+        // the top of the grid so the popup stays visible.
+        let cursor_row = self.cursor_viewport_row.max(0) as f32;
+        let anchor_y = grid_origin_y + (cursor_row + 1.) * cell_h;
 
         let element = Element::new(&font, ElementContent::Children(rows))
             .colors(ElementColors {
                 border: BorderColor::new(
-                    term_window.config.command_palette_bg_color.to_linear(),
+                    term_window.config.command_palette_fg_color.to_linear(),
                 ),
                 bg: solid_bg_color,
                 text: solid_fg_color,
             })
-            .margin(BoxDimension {
-                left: Dimension::Cells(0.25),
-                right: Dimension::Cells(0.25),
-                top: Dimension::Cells(0.25),
-                bottom: Dimension::Cells(0.25),
-            })
             .padding(BoxDimension {
-                left: Dimension::Cells(0.25),
-                right: Dimension::Cells(0.25),
+                left: Dimension::Cells(0.5),
+                right: Dimension::Cells(0.5),
                 top: Dimension::Cells(0.25),
                 bottom: Dimension::Cells(0.25),
             })
             .border(BoxDimension::new(Dimension::Pixels(1.)))
             .border_corners(Some(Corners {
                 top_left: SizedPoly {
-                    width: Dimension::Cells(0.25),
-                    height: Dimension::Cells(0.25),
+                    width: Dimension::Cells(0.5),
+                    height: Dimension::Cells(0.5),
                     poly: TOP_LEFT_ROUNDED_CORNER,
                 },
                 top_right: SizedPoly {
-                    width: Dimension::Cells(0.25),
-                    height: Dimension::Cells(0.25),
+                    width: Dimension::Cells(0.5),
+                    height: Dimension::Cells(0.5),
                     poly: TOP_RIGHT_ROUNDED_CORNER,
                 },
                 bottom_left: SizedPoly {
-                    width: Dimension::Cells(0.25),
-                    height: Dimension::Cells(0.25),
+                    width: Dimension::Cells(0.5),
+                    height: Dimension::Cells(0.5),
                     poly: BOTTOM_LEFT_ROUNDED_CORNER,
                 },
                 bottom_right: SizedPoly {
-                    width: Dimension::Cells(0.25),
-                    height: Dimension::Cells(0.25),
+                    width: Dimension::Cells(0.5),
+                    height: Dimension::Cells(0.5),
                     poly: BOTTOM_RIGHT_ROUNDED_CORNER,
                 },
             }))
-            .min_width(Some(Dimension::Pixels(desired_pixel_width)));
-
-        // Horizontally center within the available pane width.
-        let x_adjust = ((avail_pixel_width - padding_left) - desired_pixel_width) / 2.;
+            .min_width(Some(Dimension::Pixels(desired_pixel_width)))
+            .max_width(Some(Dimension::Pixels(desired_pixel_width)));
 
         let computed = term_window.compute_element(
             &LayoutContext {
                 height: DimensionContext {
                     dpi: dimensions.dpi as f32,
                     pixel_max: dimensions.pixel_height as f32,
-                    pixel_cell: metrics.cell_size.height as f32,
+                    pixel_cell: cell_h,
                 },
                 width: DimensionContext {
                     dpi: dimensions.dpi as f32,
                     pixel_max: dimensions.pixel_width as f32,
-                    pixel_cell: metrics.cell_size.width as f32,
+                    pixel_cell: cell_w,
                 },
                 bounds: euclid::rect(
-                    padding_left + x_adjust,
-                    top_pixel_y,
+                    anchor_x,
+                    anchor_y,
                     desired_pixel_width,
-                    size.rows as f32 * term_window.render_metrics.cell_size.height as f32,
+                    size.rows as f32 * cell_h,
                 ),
                 metrics: &metrics,
                 gl_state: term_window.render_state.as_ref().unwrap(),
@@ -539,7 +556,7 @@ mod tests {
     use super::*;
 
     fn mk_picker(filter: &str) -> CdPicker {
-        let picker = CdPicker::new(vec![], 0);
+        let picker = CdPicker::new(vec![], 0, 0, 0);
         *picker.selection.borrow_mut() = filter.to_string();
         *picker.filter_cursor.borrow_mut() = filter.len();
         picker
@@ -630,7 +647,7 @@ mod tests {
                 value: "/c".into(),
             },
         ];
-        let picker = CdPicker::new(entries, 0);
+        let picker = CdPicker::new(entries, 0, 0, 0);
         // Seed an all-pass match list (what `compute_matches("", …)` returns
         // for an empty filter).
         *picker.matches.borrow_mut() = Some(MatchResults {
@@ -649,7 +666,7 @@ mod tests {
 
     #[test]
     fn selected_value_is_none_when_no_matches() {
-        let picker = CdPicker::new(vec![], 0);
+        let picker = CdPicker::new(vec![], 0, 0, 0);
         *picker.matches.borrow_mut() = Some(MatchResults {
             selection: String::new(),
             matches: vec![],
