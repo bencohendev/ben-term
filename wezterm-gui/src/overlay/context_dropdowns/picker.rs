@@ -38,11 +38,31 @@ struct State {
     entries: Vec<PickerEntry>,
     filtered: Vec<usize>,
     filter: String,
+    /// Byte offset into `filter` where text insertion / deletion happens.
+    /// Anchored at `filter.len()` on startup; `Left`/`Right`/`Home`/`End`
+    /// and `Backspace`/`Delete` move or consume around this point.
+    filter_cursor: usize,
     active: usize,
     top: usize,
     max_items: usize,
     title: String,
     description: String,
+}
+
+fn prev_char_boundary(s: &str, pos: usize) -> usize {
+    s[..pos]
+        .char_indices()
+        .next_back()
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+fn next_char_boundary(s: &str, pos: usize) -> usize {
+    s[pos..]
+        .chars()
+        .next()
+        .map(|c| pos + c.len_utf8())
+        .unwrap_or(pos)
 }
 
 impl State {
@@ -79,6 +99,57 @@ impl State {
         if self.active >= self.top + self.max_items {
             self.top = self.active + 1 - self.max_items;
         }
+    }
+
+    fn filter_insert(&mut self, c: char) {
+        self.filter.insert(self.filter_cursor, c);
+        self.filter_cursor += c.len_utf8();
+        self.update_filter();
+    }
+
+    fn filter_backspace(&mut self) {
+        if self.filter_cursor == 0 {
+            return;
+        }
+        let prev = prev_char_boundary(&self.filter, self.filter_cursor);
+        self.filter.drain(prev..self.filter_cursor);
+        self.filter_cursor = prev;
+        self.update_filter();
+    }
+
+    fn filter_delete(&mut self) {
+        if self.filter_cursor >= self.filter.len() {
+            return;
+        }
+        let next = next_char_boundary(&self.filter, self.filter_cursor);
+        self.filter.drain(self.filter_cursor..next);
+        self.update_filter();
+    }
+
+    fn filter_left(&mut self) {
+        if self.filter_cursor > 0 {
+            self.filter_cursor = prev_char_boundary(&self.filter, self.filter_cursor);
+        }
+    }
+
+    fn filter_right(&mut self) {
+        if self.filter_cursor < self.filter.len() {
+            self.filter_cursor = next_char_boundary(&self.filter, self.filter_cursor);
+        }
+    }
+
+    fn filter_home(&mut self) {
+        self.filter_cursor = 0;
+    }
+
+    fn filter_end(&mut self) {
+        self.filter_cursor = self.filter.len();
+    }
+
+    fn filter_clear(&mut self) {
+        self.filter.clear();
+        self.filter_cursor = 0;
+        self.update_filter();
     }
 
     #[allow(clippy::result_large_err)] // `termwiz::Result` is used by every overlay's render
@@ -130,6 +201,20 @@ impl State {
             }
         }
 
+        // Position the terminal cursor on the filter line at the user's
+        // edit position so Left/Right feel natural. The filter row layout
+        // is: "<description> > <filter>" on row 0.
+        let desc_truncated = truncate_right(&self.description, max_width);
+        let desc_cols = wezterm_term::unicode_column_width(&desc_truncated, None);
+        let filter_prefix = &self.filter[..self.filter_cursor];
+        let cursor_col = desc_cols
+            + 3 // " > "
+            + wezterm_term::unicode_column_width(filter_prefix, None);
+        changes.push(Change::CursorPosition {
+            x: Position::Absolute(cursor_col.min(size.cols.saturating_sub(1))),
+            y: Position::Absolute(0),
+        });
+
         term.render(&changes)?;
         let _ = self.title; // kept for future Change::Title use
         Ok(())
@@ -138,10 +223,12 @@ impl State {
 
 /// Runs the picker loop. Returns `Some(entry)` on select, `None` on cancel.
 pub fn run(mut term: TermWizTerminal, params: PickerParams) -> anyhow::Result<Option<PickerEntry>> {
+    let filter_cursor = params.initial_filter.len();
     let mut state = State {
         entries: params.entries,
         filtered: vec![],
         filter: params.initial_filter,
+        filter_cursor,
         active: 0,
         top: 0,
         max_items: 1,
@@ -201,9 +288,59 @@ pub fn run(mut term: TermWizTerminal, params: PickerParams) -> anyhow::Result<Op
                 key: KeyCode::Backspace,
                 ..
             }) => {
-                if state.filter.pop().is_some() {
-                    state.update_filter();
-                }
+                state.filter_backspace();
+            }
+            InputEvent::Key(KeyEvent {
+                key: KeyCode::Delete,
+                ..
+            }) => {
+                state.filter_delete();
+            }
+            InputEvent::Key(KeyEvent {
+                key: KeyCode::LeftArrow,
+                ..
+            })
+            | InputEvent::Key(KeyEvent {
+                key: KeyCode::Char('B'),
+                modifiers: Modifiers::CTRL,
+            }) => {
+                state.filter_left();
+            }
+            InputEvent::Key(KeyEvent {
+                key: KeyCode::RightArrow,
+                ..
+            })
+            | InputEvent::Key(KeyEvent {
+                key: KeyCode::Char('F'),
+                modifiers: Modifiers::CTRL,
+            }) => {
+                state.filter_right();
+            }
+            InputEvent::Key(KeyEvent {
+                key: KeyCode::Home,
+                ..
+            })
+            | InputEvent::Key(KeyEvent {
+                key: KeyCode::Char('A'),
+                modifiers: Modifiers::CTRL,
+            }) => {
+                state.filter_home();
+            }
+            InputEvent::Key(KeyEvent {
+                key: KeyCode::End,
+                ..
+            })
+            | InputEvent::Key(KeyEvent {
+                key: KeyCode::Char('E'),
+                modifiers: Modifiers::CTRL,
+            }) => {
+                state.filter_end();
+            }
+            InputEvent::Key(KeyEvent {
+                key: KeyCode::Char('U'),
+                modifiers: Modifiers::CTRL,
+            }) => {
+                state.filter_clear();
             }
             InputEvent::Key(KeyEvent {
                 key: KeyCode::Char(c),
@@ -212,8 +349,7 @@ pub fn run(mut term: TermWizTerminal, params: PickerParams) -> anyhow::Result<Op
                 && !modifiers.contains(Modifiers::ALT)
                 && !modifiers.contains(Modifiers::SUPER) =>
             {
-                state.filter.push(c);
-                state.update_filter();
+                state.filter_insert(c);
             }
             _ => {}
         }
@@ -221,4 +357,93 @@ pub fn run(mut term: TermWizTerminal, params: PickerParams) -> anyhow::Result<Op
     }
 
     Ok(picked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_state(filter: &str) -> State {
+        State {
+            entries: vec![],
+            filtered: vec![],
+            filter: filter.to_string(),
+            filter_cursor: filter.len(),
+            active: 0,
+            top: 0,
+            max_items: 1,
+            title: String::new(),
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn insert_at_cursor_inserts_midway() {
+        let mut s = mk_state("foo");
+        s.filter_cursor = 1; // between 'f' and 'o'
+        s.filter_insert('X');
+        assert_eq!(s.filter, "fXoo");
+        assert_eq!(s.filter_cursor, 2);
+    }
+
+    #[test]
+    fn left_right_respect_bounds() {
+        let mut s = mk_state("ab");
+        assert_eq!(s.filter_cursor, 2);
+        s.filter_right();
+        assert_eq!(s.filter_cursor, 2, "right at end is a no-op");
+        s.filter_left();
+        s.filter_left();
+        s.filter_left();
+        assert_eq!(s.filter_cursor, 0, "left at start saturates to 0");
+    }
+
+    #[test]
+    fn backspace_removes_before_cursor() {
+        let mut s = mk_state("hello");
+        s.filter_cursor = 3; // between 'l' and 'l'
+        s.filter_backspace();
+        assert_eq!(s.filter, "helo");
+        assert_eq!(s.filter_cursor, 2);
+    }
+
+    #[test]
+    fn delete_removes_at_cursor() {
+        let mut s = mk_state("hello");
+        s.filter_cursor = 2;
+        s.filter_delete();
+        assert_eq!(s.filter, "helo");
+        assert_eq!(s.filter_cursor, 2, "delete leaves cursor in place");
+    }
+
+    #[test]
+    fn home_end_jump_to_boundaries() {
+        let mut s = mk_state("abcdef");
+        s.filter_home();
+        assert_eq!(s.filter_cursor, 0);
+        s.filter_end();
+        assert_eq!(s.filter_cursor, 6);
+    }
+
+    #[test]
+    fn ctrl_u_clears_and_resets_cursor() {
+        let mut s = mk_state("abcdef");
+        s.filter_clear();
+        assert_eq!(s.filter, "");
+        assert_eq!(s.filter_cursor, 0);
+    }
+
+    /// Multi-byte chars: `é` is 2 bytes. Cursor moves must land on char
+    /// boundaries or filter.insert / drain panics at runtime.
+    #[test]
+    fn handles_multibyte_chars() {
+        let mut s = mk_state("café");
+        assert_eq!(s.filter.len(), 5);
+        s.filter_left();
+        // é starts at byte 3 in "café".
+        assert_eq!(s.filter_cursor, 3);
+        s.filter_backspace();
+        assert_eq!(s.filter, "caé");
+        assert_eq!(s.filter_cursor, 2);
+    }
 }
