@@ -369,7 +369,10 @@ pub struct TermWindow {
     os_parameters: Option<parameters::Parameters>,
     /// When we most recently received keyboard focus
     pub focused: Option<Instant>,
-    fonts: Rc<FontConfiguration>,
+    // NOTE: made `pub` so `Modal` implementations outside the `termwindow`
+    // module (ben-term custom context dropdowns) can read them with the same
+    // access that upstream modals (palette/charselect/paneselect) enjoy.
+    pub fonts: Rc<FontConfiguration>,
     /// Window dimensions and dpi
     pub dimensions: Dimensions,
     pub window_state: WindowState,
@@ -381,13 +384,13 @@ pub struct TermWindow {
     pub mux_window_id: MuxWindowId,
     pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
     pub render_metrics: RenderMetrics,
-    render_state: Option<RenderState>,
+    pub render_state: Option<RenderState>,
     input_map: InputMap,
     /// If is_some, the LEADER modifier is active until the specified instant.
     leader_is_down: Option<std::time::Instant>,
     dead_key_status: DeadKeyStatus,
     key_table_state: KeyTableState,
-    show_tab_bar: bool,
+    pub show_tab_bar: bool,
     show_scroll_bar: bool,
     tab_bar: TabBarState,
     fancy_tab_bar: Option<box_model::ComputedElement>,
@@ -1841,7 +1844,9 @@ impl TermWindow {
         self.emit_window_event("window-config-reloaded", None);
     }
 
-    fn invalidate_modal(&mut self) {
+    // NOTE: `pub` so `Modal` implementations outside the `termwindow` module
+    // (ben-term context dropdowns) can request relayout after handling a key.
+    pub fn invalidate_modal(&mut self) {
         if let Some(modal) = self.get_modal() {
             modal.reconfigure(self);
             if let Some(window) = self.window.as_ref() {
@@ -1866,6 +1871,20 @@ impl TermWindow {
 
     fn get_modal(&self) -> Option<Rc<dyn Modal>> {
         self.modal.borrow().as_ref().map(|m| Rc::clone(&m))
+    }
+
+    /// Whether a `Modal` popup is currently installed for this window.
+    /// Exposed for the context-dropdown trigger guard chain, which must not
+    /// fire Space-activated pickers on top of an existing modal.
+    pub fn has_modal(&self) -> bool {
+        self.modal.borrow().is_some()
+    }
+
+    /// Current terminal grid size (cols / rows / pixels / dpi).
+    /// Exposed so custom popups outside the `termwindow` module can size
+    /// themselves relative to the terminal.
+    pub fn terminal_size(&self) -> TerminalSize {
+        self.terminal_size
     }
 
     fn update_scrollbar(&mut self) {

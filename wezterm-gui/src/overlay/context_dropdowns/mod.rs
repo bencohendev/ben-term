@@ -8,7 +8,7 @@
 //! Isolated from upstream overlay code to keep rebases clean.
 
 pub mod cd;
-pub mod picker;
+pub mod cd_picker;
 
 use mux::pane::Pane;
 use std::sync::Arc;

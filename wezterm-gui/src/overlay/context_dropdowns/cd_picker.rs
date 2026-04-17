@@ -1,0 +1,676 @@
+//! Popup `cd` picker rendered as a `Modal`.
+//!
+//! v3 replacement for the full-pane overlay picker. Reuses the command palette's
+//! paint + input plumbing (zindex 100, `paint_modal` integration, keyevent
+//! dispatch), but does NOT import from `palette.rs` — keeps our divergence
+//! isolated so upstream palette changes don't ripple into here.
+//!
+//! The picker body is half-width and top-anchored so the shell prompt and
+//! surrounding output stay visible around it. Trigger + candidate gathering
+//! logic lives in `cd.rs`; this file only owns render and per-keystroke state.
+
+use crate::overlay::selector::{matcher_pattern, matcher_score};
+use crate::termwindow::box_model::{
+    BorderColor, BoxDimension, ComputedElement, Corners, DisplayType, Element, ElementColors,
+    ElementContent, InheritableColor, LayoutContext, SizedPoly,
+};
+use crate::termwindow::modal::Modal;
+use crate::termwindow::render::corners::{
+    BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
+    TOP_RIGHT_ROUNDED_CORNER,
+};
+use crate::termwindow::TermWindow;
+use crate::utilsprites::RenderMetrics;
+use config::{Dimension, DimensionContext};
+use mux::pane::PaneId;
+use rayon::prelude::*;
+use std::cell::{Ref, RefCell};
+use wezterm_term::{KeyCode, KeyModifiers, MouseEvent};
+use window::color::LinearRgba;
+
+/// One candidate row in the picker.
+#[derive(Debug, Clone)]
+pub struct PickerEntry {
+    /// Shown in the list (e.g. a `strip_prefix`'d relative path).
+    pub label: String,
+    /// Pasted into the shell on select (e.g. the absolute path).
+    pub value: String,
+}
+
+struct MatchResults {
+    selection: String,
+    /// Indices into `entries`, sorted by descending match score.
+    matches: Vec<usize>,
+}
+
+pub struct CdPicker {
+    entries: Vec<PickerEntry>,
+    source_pane_id: PaneId,
+    /// Viewport column of the shell cursor at trigger time (used to anchor
+    /// the popup just below/left-aligned to the typed `cd ` insertion point).
+    cursor_col: usize,
+    /// Viewport row of the shell cursor at trigger time. Can be negative if
+    /// the cursor is above the visible area, though in practice the picker
+    /// only fires at a live prompt where the cursor is on-screen.
+    cursor_viewport_row: isize,
+    // Interior mutability: `Modal` methods take `&self`.
+    selection: RefCell<String>,
+    /// Byte offset into `selection` where the next insert/delete happens.
+    filter_cursor: RefCell<usize>,
+    selected_row: RefCell<usize>,
+    top_row: RefCell<usize>,
+    matches: RefCell<Option<MatchResults>>,
+    element: RefCell<Option<Vec<ComputedElement>>>,
+    max_rows_on_screen: RefCell<usize>,
+}
+
+impl CdPicker {
+    pub fn new(
+        entries: Vec<PickerEntry>,
+        source_pane_id: PaneId,
+        cursor_col: usize,
+        cursor_viewport_row: isize,
+    ) -> Self {
+        Self {
+            entries,
+            source_pane_id,
+            cursor_col,
+            cursor_viewport_row,
+            selection: RefCell::new(String::new()),
+            filter_cursor: RefCell::new(0),
+            selected_row: RefCell::new(0),
+            top_row: RefCell::new(0),
+            matches: RefCell::new(None),
+            element: RefCell::new(None),
+            max_rows_on_screen: RefCell::new(0),
+        }
+    }
+
+    fn updated_input(&self) {
+        *self.selected_row.borrow_mut() = 0;
+        *self.top_row.borrow_mut() = 0;
+    }
+
+    fn move_up(&self) {
+        let mut row = self.selected_row.borrow_mut();
+        *row = row.saturating_sub(1);
+        let mut top_row = self.top_row.borrow_mut();
+        if *row < *top_row {
+            *top_row = *row;
+        }
+    }
+
+    fn move_down(&self) {
+        let max_rows_on_screen = *self.max_rows_on_screen.borrow();
+        let limit = self
+            .matches
+            .borrow()
+            .as_ref()
+            .map(|m| m.matches.len())
+            .unwrap_or_else(|| self.entries.len())
+            .saturating_sub(1);
+        let mut row = self.selected_row.borrow_mut();
+        *row = row.saturating_add(1).min(limit);
+        let mut top_row = self.top_row.borrow_mut();
+        if max_rows_on_screen > 0 && *row > *top_row + max_rows_on_screen - 1 {
+            *top_row = row.saturating_sub(max_rows_on_screen - 1);
+        }
+    }
+
+    fn filter_insert(&self, c: char) {
+        let mut selection = self.selection.borrow_mut();
+        let mut cursor = self.filter_cursor.borrow_mut();
+        selection.insert(*cursor, c);
+        *cursor += c.len_utf8();
+    }
+
+    fn filter_backspace(&self) {
+        let mut selection = self.selection.borrow_mut();
+        let mut cursor = self.filter_cursor.borrow_mut();
+        if *cursor == 0 {
+            return;
+        }
+        let prev = prev_char_boundary(&selection, *cursor);
+        selection.drain(prev..*cursor);
+        *cursor = prev;
+    }
+
+    fn filter_delete(&self) {
+        let mut selection = self.selection.borrow_mut();
+        let cursor = *self.filter_cursor.borrow();
+        if cursor >= selection.len() {
+            return;
+        }
+        let next = next_char_boundary(&selection, cursor);
+        selection.drain(cursor..next);
+    }
+
+    fn filter_left(&self) {
+        let selection = self.selection.borrow();
+        let mut cursor = self.filter_cursor.borrow_mut();
+        if *cursor > 0 {
+            *cursor = prev_char_boundary(&selection, *cursor);
+        }
+    }
+
+    fn filter_right(&self) {
+        let selection = self.selection.borrow();
+        let mut cursor = self.filter_cursor.borrow_mut();
+        if *cursor < selection.len() {
+            *cursor = next_char_boundary(&selection, *cursor);
+        }
+    }
+
+    fn filter_home(&self) {
+        *self.filter_cursor.borrow_mut() = 0;
+    }
+
+    fn filter_end(&self) {
+        *self.filter_cursor.borrow_mut() = self.selection.borrow().len();
+    }
+
+    fn filter_clear(&self) {
+        self.selection.borrow_mut().clear();
+        *self.filter_cursor.borrow_mut() = 0;
+    }
+
+    /// Returns the absolute path to paste on Enter, or None if there's no
+    /// valid selection (empty match list).
+    fn selected_value(&self) -> Option<String> {
+        let selected_idx = *self.selected_row.borrow();
+        let matches = self.matches.borrow();
+        let results = matches.as_ref()?;
+        let entry_idx = *results.matches.get(selected_idx)?;
+        self.entries.get(entry_idx).map(|e| e.value.clone())
+    }
+
+    fn compute(
+        &self,
+        term_window: &mut TermWindow,
+        matches: &MatchResults,
+        max_rows_on_screen: usize,
+    ) -> anyhow::Result<Vec<ComputedElement>> {
+        let selection_ref = self.selection.borrow();
+        let selection = selection_ref.as_str();
+        let filter_cursor = *self.filter_cursor.borrow();
+        let entries = self.entries.as_slice();
+        let selected_row = *self.selected_row.borrow();
+        let top_row = *self.top_row.borrow();
+        let font = term_window
+            .fonts
+            .command_palette_font()
+            .expect("to resolve command palette font");
+        let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+
+        let top_bar_height = if term_window.show_tab_bar && !term_window.config.tab_bar_at_bottom {
+            term_window.tab_bar_pixel_height().unwrap()
+        } else {
+            0.
+        };
+        let (padding_left, padding_top) = term_window.padding_left_top();
+        let os_border = term_window.get_os_border();
+        let grid_origin_y = top_bar_height + padding_top + os_border.top.get() as f32;
+
+        let solid_bg_color: InheritableColor = term_window
+            .config
+            .command_palette_bg_color
+            .to_linear()
+            .into();
+        let solid_fg_color: InheritableColor = term_window
+            .config
+            .command_palette_fg_color
+            .to_linear()
+            .into();
+
+        // Header row: `> <filter text with an underscore caret>`. Rendering
+        // the caret inline avoids the need for a separate cursor primitive.
+        let (before_caret, after_caret) = selection.split_at(filter_cursor.min(selection.len()));
+        let header_text = format!("> {before_caret}_{after_caret}");
+        let mut rows =
+            vec![
+                Element::new(&font, ElementContent::Text(header_text))
+                    .colors(ElementColors {
+                        border: BorderColor::default(),
+                        bg: LinearRgba::TRANSPARENT.into(),
+                        text: solid_fg_color.clone(),
+                    })
+                    .display(DisplayType::Block),
+            ];
+
+        if matches.matches.is_empty() {
+            rows.push(
+                Element::new(&font, ElementContent::Text("  (no matches)".to_string()))
+                    .colors(ElementColors {
+                        border: BorderColor::default(),
+                        bg: LinearRgba::TRANSPARENT.into(),
+                        text: solid_fg_color.clone(),
+                    })
+                    .display(DisplayType::Block),
+            );
+        } else {
+            for (display_idx, entry) in matches
+                .matches
+                .iter()
+                .map(|&idx| &entries[idx])
+                .enumerate()
+                .skip(top_row)
+                .take(max_rows_on_screen)
+            {
+                let (bg, text) = if display_idx == selected_row {
+                    (solid_fg_color.clone(), solid_bg_color.clone())
+                } else {
+                    (LinearRgba::TRANSPARENT.into(), solid_fg_color.clone())
+                };
+
+                rows.push(
+                    Element::new(&font, ElementContent::Text(format!("  {}", entry.label)))
+                        .colors(ElementColors {
+                            border: BorderColor::default(),
+                            bg,
+                            text,
+                        })
+                        .padding(BoxDimension {
+                            left: Dimension::Cells(0.25),
+                            right: Dimension::Cells(0.25),
+                            top: Dimension::Cells(0.),
+                            bottom: Dimension::Cells(0.),
+                        })
+                        .min_width(Some(Dimension::Percent(1.)))
+                        .display(DisplayType::Block),
+                );
+            }
+        }
+
+        let dimensions = term_window.dimensions;
+        let size = term_window.terminal_size();
+        let cell_w = term_window.render_metrics.cell_size.width as f32;
+        let cell_h = term_window.render_metrics.cell_size.height as f32;
+        let avail_pixel_width = size.cols as f32 * cell_w;
+
+        // Sizing: narrow popup anchored near the cursor — a dropdown, not a
+        // palette. 50 cols reads comfortably for most paths without dominating
+        // the pane. Clamped to available width on narrow windows.
+        let desired_width_cells = 50_usize.min(size.cols.max(1));
+        let desired_pixel_width = desired_width_cells as f32 * cell_w;
+
+        // Anchor X: left-aligned to the cursor column, but clamped so the
+        // popup doesn't spill off the right edge.
+        let cursor_x_px = padding_left + self.cursor_col as f32 * cell_w;
+        let max_x_px = padding_left + avail_pixel_width - desired_pixel_width;
+        let anchor_x = cursor_x_px.min(max_x_px).max(padding_left);
+
+        // Anchor Y: one row below the cursor row. Negative viewport_row means
+        // the cursor has scrolled above the visible area — rare, but clamp to
+        // the top of the grid so the popup stays visible.
+        let cursor_row = self.cursor_viewport_row.max(0) as f32;
+        let anchor_y = grid_origin_y + (cursor_row + 1.) * cell_h;
+
+        let element = Element::new(&font, ElementContent::Children(rows))
+            .colors(ElementColors {
+                border: BorderColor::new(
+                    term_window.config.command_palette_fg_color.to_linear(),
+                ),
+                bg: solid_bg_color,
+                text: solid_fg_color,
+            })
+            .padding(BoxDimension {
+                left: Dimension::Cells(0.5),
+                right: Dimension::Cells(0.5),
+                top: Dimension::Cells(0.25),
+                bottom: Dimension::Cells(0.25),
+            })
+            .border(BoxDimension::new(Dimension::Pixels(1.)))
+            .border_corners(Some(Corners {
+                top_left: SizedPoly {
+                    width: Dimension::Cells(0.5),
+                    height: Dimension::Cells(0.5),
+                    poly: TOP_LEFT_ROUNDED_CORNER,
+                },
+                top_right: SizedPoly {
+                    width: Dimension::Cells(0.5),
+                    height: Dimension::Cells(0.5),
+                    poly: TOP_RIGHT_ROUNDED_CORNER,
+                },
+                bottom_left: SizedPoly {
+                    width: Dimension::Cells(0.5),
+                    height: Dimension::Cells(0.5),
+                    poly: BOTTOM_LEFT_ROUNDED_CORNER,
+                },
+                bottom_right: SizedPoly {
+                    width: Dimension::Cells(0.5),
+                    height: Dimension::Cells(0.5),
+                    poly: BOTTOM_RIGHT_ROUNDED_CORNER,
+                },
+            }))
+            .min_width(Some(Dimension::Pixels(desired_pixel_width)))
+            .max_width(Some(Dimension::Pixels(desired_pixel_width)));
+
+        let computed = term_window.compute_element(
+            &LayoutContext {
+                height: DimensionContext {
+                    dpi: dimensions.dpi as f32,
+                    pixel_max: dimensions.pixel_height as f32,
+                    pixel_cell: cell_h,
+                },
+                width: DimensionContext {
+                    dpi: dimensions.dpi as f32,
+                    pixel_max: dimensions.pixel_width as f32,
+                    pixel_cell: cell_w,
+                },
+                bounds: euclid::rect(
+                    anchor_x,
+                    anchor_y,
+                    desired_pixel_width,
+                    size.rows as f32 * cell_h,
+                ),
+                metrics: &metrics,
+                gl_state: term_window.render_state.as_ref().unwrap(),
+                zindex: 100,
+            },
+            &element,
+        )?;
+
+        Ok(vec![computed])
+    }
+}
+
+fn prev_char_boundary(s: &str, pos: usize) -> usize {
+    s[..pos]
+        .char_indices()
+        .next_back()
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+fn next_char_boundary(s: &str, pos: usize) -> usize {
+    s[pos..]
+        .chars()
+        .next()
+        .map(|c| pos + c.len_utf8())
+        .unwrap_or(pos)
+}
+
+fn compute_matches(selection: &str, entries: &[PickerEntry]) -> Vec<usize> {
+    if selection.is_empty() {
+        (0..entries.len()).collect()
+    } else {
+        let pattern = matcher_pattern(selection);
+        let mut scored: Vec<(usize, u32)> = entries
+            .par_iter()
+            .enumerate()
+            .filter_map(|(idx, e)| matcher_score(&pattern, &e.label).map(|s| (idx, s)))
+            .collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.into_iter().map(|(idx, _)| idx).collect()
+    }
+}
+
+impl Modal for CdPicker {
+    fn mouse_event(&self, _event: MouseEvent, _term_window: &mut TermWindow) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn key_down(
+        &self,
+        key: KeyCode,
+        mods: KeyModifiers,
+        term_window: &mut TermWindow,
+    ) -> anyhow::Result<bool> {
+        match (key, mods) {
+            (KeyCode::Escape, KeyModifiers::NONE)
+            | (KeyCode::Char('g'), KeyModifiers::CTRL)
+            | (KeyCode::Char('c'), KeyModifiers::CTRL) => {
+                term_window.cancel_modal();
+                return Ok(true);
+            }
+            (KeyCode::UpArrow, KeyModifiers::NONE)
+            | (KeyCode::Char('p'), KeyModifiers::CTRL)
+            | (KeyCode::Char('k'), KeyModifiers::CTRL) => {
+                self.move_up();
+            }
+            (KeyCode::DownArrow, KeyModifiers::NONE)
+            | (KeyCode::Char('n'), KeyModifiers::CTRL)
+            | (KeyCode::Char('j'), KeyModifiers::CTRL) => {
+                self.move_down();
+            }
+            (KeyCode::PageUp, KeyModifiers::NONE) => {
+                let step = *self.max_rows_on_screen.borrow();
+                for _ in 0..step {
+                    self.move_up();
+                }
+            }
+            (KeyCode::PageDown, KeyModifiers::NONE) => {
+                let step = *self.max_rows_on_screen.borrow();
+                for _ in 0..step {
+                    self.move_down();
+                }
+            }
+            (KeyCode::LeftArrow, KeyModifiers::NONE)
+            | (KeyCode::Char('b'), KeyModifiers::CTRL) => {
+                self.filter_left();
+            }
+            (KeyCode::RightArrow, KeyModifiers::NONE)
+            | (KeyCode::Char('f'), KeyModifiers::CTRL) => {
+                self.filter_right();
+            }
+            (KeyCode::Home, KeyModifiers::NONE) | (KeyCode::Char('a'), KeyModifiers::CTRL) => {
+                self.filter_home();
+            }
+            (KeyCode::End, KeyModifiers::NONE) | (KeyCode::Char('e'), KeyModifiers::CTRL) => {
+                self.filter_end();
+            }
+            (KeyCode::Backspace, KeyModifiers::NONE) => {
+                self.filter_backspace();
+                self.updated_input();
+            }
+            (KeyCode::Delete, KeyModifiers::NONE) => {
+                self.filter_delete();
+                self.updated_input();
+            }
+            (KeyCode::Char('u'), KeyModifiers::CTRL) => {
+                self.filter_clear();
+                self.updated_input();
+            }
+            (KeyCode::Char(c), KeyModifiers::NONE) | (KeyCode::Char(c), KeyModifiers::SHIFT) => {
+                self.filter_insert(c);
+                self.updated_input();
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                if let Some(value) = self.selected_value() {
+                    let mux = mux::Mux::get();
+                    if let Some(pane) = mux.get_pane(self.source_pane_id) {
+                        // User already typed `cd` before Space — only append
+                        // the argument. Leading space + shell-quoted path.
+                        let insertion = format!(" {}", super::cd::shell_quote(&value));
+                        let _ = pane.send_paste(&insertion);
+                    }
+                }
+                term_window.cancel_modal();
+                return Ok(true);
+            }
+            _ => return Ok(false),
+        }
+        term_window.invalidate_modal();
+        Ok(true)
+    }
+
+    fn computed_element(
+        &self,
+        term_window: &mut TermWindow,
+    ) -> anyhow::Result<Ref<'_, [ComputedElement]>> {
+        let selection = self.selection.borrow().clone();
+
+        let font = term_window
+            .fonts
+            .command_palette_font()
+            .expect("to resolve command palette font");
+        let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+
+        // 60% of window height, minus the header and some breathing room.
+        let max_rows_on_screen = ((term_window.dimensions.pixel_height * 6 / 10)
+            / metrics.cell_size.height as usize)
+            .saturating_sub(3)
+            .max(1);
+        *self.max_rows_on_screen.borrow_mut() = max_rows_on_screen;
+
+        {
+            let mut results = self.matches.borrow_mut();
+            let rebuild = results
+                .as_ref()
+                .map(|m| m.selection != selection)
+                .unwrap_or(true);
+            if rebuild {
+                results.replace(MatchResults {
+                    selection: selection.clone(),
+                    matches: compute_matches(&selection, &self.entries),
+                });
+                // Keep selected_row in bounds after re-score.
+                let new_len = results.as_ref().map(|m| m.matches.len()).unwrap_or(0);
+                let mut row = self.selected_row.borrow_mut();
+                if *row >= new_len {
+                    *row = new_len.saturating_sub(1).min(new_len);
+                }
+            }
+        }
+
+        if self.element.borrow().is_none() {
+            let matches_ref = self.matches.borrow();
+            let matches = matches_ref.as_ref().unwrap();
+            let element = self.compute(term_window, matches, max_rows_on_screen)?;
+            drop(matches_ref);
+            self.element.borrow_mut().replace(element);
+        }
+
+        Ok(Ref::map(self.element.borrow(), |v| {
+            v.as_ref().unwrap().as_slice()
+        }))
+    }
+
+    fn reconfigure(&self, _term_window: &mut TermWindow) {
+        self.element.borrow_mut().take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_picker(filter: &str) -> CdPicker {
+        let picker = CdPicker::new(vec![], 0, 0, 0);
+        *picker.selection.borrow_mut() = filter.to_string();
+        *picker.filter_cursor.borrow_mut() = filter.len();
+        picker
+    }
+
+    #[test]
+    fn insert_at_cursor_inserts_midway() {
+        let p = mk_picker("foo");
+        *p.filter_cursor.borrow_mut() = 1;
+        p.filter_insert('X');
+        assert_eq!(*p.selection.borrow(), "fXoo");
+        assert_eq!(*p.filter_cursor.borrow(), 2);
+    }
+
+    #[test]
+    fn left_right_respect_bounds() {
+        let p = mk_picker("ab");
+        assert_eq!(*p.filter_cursor.borrow(), 2);
+        p.filter_right();
+        assert_eq!(*p.filter_cursor.borrow(), 2, "right at end is a no-op");
+        p.filter_left();
+        p.filter_left();
+        p.filter_left();
+        assert_eq!(*p.filter_cursor.borrow(), 0, "left at start saturates to 0");
+    }
+
+    #[test]
+    fn backspace_removes_before_cursor() {
+        let p = mk_picker("hello");
+        *p.filter_cursor.borrow_mut() = 3;
+        p.filter_backspace();
+        assert_eq!(*p.selection.borrow(), "helo");
+        assert_eq!(*p.filter_cursor.borrow(), 2);
+    }
+
+    #[test]
+    fn delete_removes_at_cursor() {
+        let p = mk_picker("hello");
+        *p.filter_cursor.borrow_mut() = 2;
+        p.filter_delete();
+        assert_eq!(*p.selection.borrow(), "helo");
+        assert_eq!(*p.filter_cursor.borrow(), 2, "delete leaves cursor in place");
+    }
+
+    #[test]
+    fn home_end_jump_to_boundaries() {
+        let p = mk_picker("abcdef");
+        p.filter_home();
+        assert_eq!(*p.filter_cursor.borrow(), 0);
+        p.filter_end();
+        assert_eq!(*p.filter_cursor.borrow(), 6);
+    }
+
+    #[test]
+    fn ctrl_u_clears_and_resets_cursor() {
+        let p = mk_picker("abcdef");
+        p.filter_clear();
+        assert_eq!(*p.selection.borrow(), "");
+        assert_eq!(*p.filter_cursor.borrow(), 0);
+    }
+
+    /// Multi-byte chars: `é` is 2 bytes. Cursor moves must land on char
+    /// boundaries or filter.insert / drain panics at runtime.
+    #[test]
+    fn handles_multibyte_chars() {
+        let p = mk_picker("café");
+        assert_eq!(p.selection.borrow().len(), 5);
+        p.filter_left();
+        assert_eq!(*p.filter_cursor.borrow(), 3);
+        p.filter_backspace();
+        assert_eq!(*p.selection.borrow(), "caé");
+        assert_eq!(*p.filter_cursor.borrow(), 2);
+    }
+
+    #[test]
+    fn enter_resolves_selected_entry() {
+        let entries = vec![
+            PickerEntry {
+                label: "a".into(),
+                value: "/a".into(),
+            },
+            PickerEntry {
+                label: "b".into(),
+                value: "/b".into(),
+            },
+            PickerEntry {
+                label: "c".into(),
+                value: "/c".into(),
+            },
+        ];
+        let picker = CdPicker::new(entries, 0, 0, 0);
+        // Seed an all-pass match list (what `compute_matches("", …)` returns
+        // for an empty filter).
+        *picker.matches.borrow_mut() = Some(MatchResults {
+            selection: String::new(),
+            matches: vec![0, 1, 2],
+        });
+        assert_eq!(picker.selected_value().as_deref(), Some("/a"));
+        picker.move_down();
+        assert_eq!(picker.selected_value().as_deref(), Some("/b"));
+        picker.move_down();
+        assert_eq!(picker.selected_value().as_deref(), Some("/c"));
+        // Down at the last row saturates.
+        picker.move_down();
+        assert_eq!(picker.selected_value().as_deref(), Some("/c"));
+    }
+
+    #[test]
+    fn selected_value_is_none_when_no_matches() {
+        let picker = CdPicker::new(vec![], 0, 0, 0);
+        *picker.matches.borrow_mut() = Some(MatchResults {
+            selection: String::new(),
+            matches: vec![],
+        });
+        assert!(picker.selected_value().is_none());
+    }
+}
