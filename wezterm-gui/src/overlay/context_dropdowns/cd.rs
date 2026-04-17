@@ -1,8 +1,12 @@
 //! `cd` context dropdown.
 //!
 //! Guard chain:
-//!   config.cd_picker_enabled → at_shell_prompt → line-left matches `^\s*cd$`
-//!   AND line-right is empty/whitespace.
+//!   config.cd_picker_enabled → not alt-screen → no existing overlay →
+//!   trigger text check. Two trigger modes:
+//!   - Strict (OSC 133 Input zone available): first token is `cd` AND
+//!     right-of-cursor within the zone is empty/whitespace.
+//!   - Fallback (no OSC 133): last whitespace-delimited token of the line
+//!     left of cursor is `cd`.
 //!
 //! Candidates (matches the user's zsh widget at ~/.zshrc:184-202):
 //!   1. Pinned shortcuts: `..`, `-`, `~`
@@ -16,7 +20,9 @@
 //! avoid bracketed-paste expansion inconsistencies across shells.
 
 use crate::overlay::context_dropdowns::picker::{self, PickerEntry, PickerParams};
-use crate::overlay::context_dropdowns::{split_logical_line_at_cursor, TriggerResult};
+use crate::overlay::context_dropdowns::{
+    split_input_zone_at_cursor, split_logical_line_at_cursor, TriggerResult,
+};
 use crate::overlay::start_overlay_pane;
 use crate::termwindow::TermWindow;
 use mux::pane::Pane;
@@ -47,15 +53,27 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
         return TriggerResult::PassThrough;
     }
 
-    let Some((left, _right)) = split_logical_line_at_cursor(pane) else {
-        return TriggerResult::PassThrough;
-    };
-    // Note: we deliberately don't constrain right-of-cursor — shells with
-    // RPROMPT (zsh powerline themes, git-status blocks) render content to
-    // the right of the input buffer, which would otherwise block the trigger.
-    // v2 will use OSC 133 semantic zones for precise input-vs-chrome.
-    if !is_cd_trigger(&left) {
-        return TriggerResult::PassThrough;
+    // Prefer the OSC 133 Input zone when the shell emits semantic prompt
+    // markers — it gives us the exact command-line text with no prompt or
+    // RPROMPT contamination, enabling strict first-token and trailing-edge
+    // checks. Fall back to the line-heuristic for shells without integration.
+    match split_input_zone_at_cursor(pane) {
+        Some((left, right)) => {
+            if !is_cd_command_start(&left) || !right.trim().is_empty() {
+                return TriggerResult::PassThrough;
+            }
+        }
+        None => {
+            let Some((left, _right)) = split_logical_line_at_cursor(pane) else {
+                return TriggerResult::PassThrough;
+            };
+            // Without OSC 133, right-of-cursor is unreliable — shells with
+            // RPROMPT render chrome to the right of the input buffer, which
+            // would otherwise block the trigger. Last-token match only.
+            if !is_cd_trigger(&left) {
+                return TriggerResult::PassThrough;
+            }
+        }
     }
 
     let cwd = pane
@@ -111,14 +129,25 @@ fn run_cd_picker(
     Ok(())
 }
 
-/// Trigger fires when the last whitespace-delimited token in the line-left-of-cursor
-/// is `cd`. Reading the literal line buffer includes the shell prompt (e.g. `~ $ cd`),
-/// so we can't match the whole string — only the trailing token.
+/// Fallback trigger for shells without OSC 133: fires when the last
+/// whitespace-delimited token in the line-left-of-cursor is `cd`. Reading
+/// the literal line buffer includes the shell prompt (e.g. `~ $ cd`), so
+/// we can't match the whole string — only the trailing token.
 ///
-/// This does fire on lines like `echo cd ` where cd is an argument, not the command.
-/// Press Escape to dismiss; v2 will use OSC 133 semantic zones to narrow this.
+/// This fires on lines like `echo cd ` where cd is an argument, not the
+/// command. Press Escape to dismiss; installing wezterm's shell integration
+/// enables the strict `is_cd_command_start` path which avoids this.
 fn is_cd_trigger(left: &str) -> bool {
     left.split_whitespace().last() == Some("cd")
+}
+
+/// Strict trigger for OSC 133-enabled shells: `left` is the text of the
+/// Input zone (actual command buffer) up to the cursor. The command line
+/// starts with `cd` iff the first whitespace-delimited token is `cd`.
+/// Lines like `echo cd` correctly reject because the first token is `echo`.
+fn is_cd_command_start(left: &str) -> bool {
+    let mut toks = left.split_whitespace();
+    toks.next() == Some("cd") && toks.next().is_none()
 }
 
 fn gather_candidates(
@@ -343,11 +372,46 @@ mod tests {
         assert!(!is_cd_trigger("cd foo"));
     }
 
-    /// Known-imperfect: v1 fires on this; user can press Escape. v2 will
-    /// use OSC 133 to distinguish prompt-context `cd` from argument `cd`.
+    /// The heuristic fallback fires on this — it's the known limitation of
+    /// the OSC-133-less path. The strict `is_cd_command_start` test below
+    /// covers the v2 path that correctly rejects it.
     #[test]
-    fn trigger_has_known_false_positive_on_cd_as_argument() {
+    fn heuristic_has_known_false_positive_on_cd_as_argument() {
         assert!(is_cd_trigger("echo cd"));
+    }
+
+    #[test]
+    fn strict_accepts_bare_cd() {
+        assert!(is_cd_command_start("cd"));
+        assert!(is_cd_command_start("  cd"));
+        assert!(is_cd_command_start("cd "));
+        assert!(is_cd_command_start("cd\t"));
+        assert!(is_cd_command_start("\tcd  "));
+    }
+
+    /// The core v2 fix: an OSC 133 Input zone containing `echo cd` is
+    /// correctly recognized as NOT the start of a `cd` command.
+    #[test]
+    fn strict_rejects_cd_as_argument() {
+        assert!(!is_cd_command_start("echo cd"));
+        assert!(!is_cd_command_start("  sudo cd"));
+    }
+
+    #[test]
+    fn strict_rejects_partial_cd_word() {
+        assert!(!is_cd_command_start("cde"));
+        assert!(!is_cd_command_start("cdfoo"));
+        assert!(!is_cd_command_start(""));
+        assert!(!is_cd_command_start("   "));
+    }
+
+    /// After Space, the Input zone-left of cursor is typically `cd` with no
+    /// trailing args. If the user typed more before Space, the second token
+    /// means we're mid-argument and the picker should not open.
+    #[test]
+    fn strict_rejects_cd_with_argument_already_typed() {
+        assert!(!is_cd_command_start("cd foo"));
+        assert!(!is_cd_command_start("cd /tmp"));
     }
 
     /// Verifies the default Space binding actually reaches default_key_assignments.

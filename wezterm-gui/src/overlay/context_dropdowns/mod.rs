@@ -12,6 +12,7 @@ pub mod picker;
 
 use mux::pane::Pane;
 use std::sync::Arc;
+use wezterm_term::SemanticType;
 
 /// Outcome of a trigger attempt. Mirrors `PerformAssignmentResult` semantics
 /// so it can be returned directly from `perform_key_assignment` dispatch.
@@ -38,5 +39,57 @@ pub fn split_logical_line_at_cursor(pane: &Arc<dyn Pane>) -> Option<(String, Str
     let lx = lx.min(logical_len);
     let left = line.logical.columns_as_str(0..lx);
     let right = line.logical.columns_as_str(lx..logical_len);
+    Some((left, right))
+}
+
+/// If the shell has OSC 133 integration installed, return the portion of the
+/// Input zone (the actual command line, excluding prompt chrome and RPROMPT)
+/// to the left and right of the cursor.
+///
+/// Returns `None` when no Input zone contains the cursor — callers should
+/// fall back to the heuristic `split_logical_line_at_cursor` for shells
+/// without OSC 133.
+///
+/// Why this matters: the Input zone precisely marks where the user's command
+/// starts and ends, so the picker can check the FIRST token of the command
+/// (rejecting `echo cd ` where `cd` is an argument) and enforce that the
+/// cursor is at the trailing edge of the zone (rejecting `cd fo|o` where
+/// content follows the cursor inside the command buffer).
+pub fn split_input_zone_at_cursor(pane: &Arc<dyn Pane>) -> Option<(String, String)> {
+    let cursor = pane.get_cursor_position();
+    let zones = pane.get_semantic_zones().ok()?;
+    let zone = zones.into_iter().find(|z| {
+        z.semantic_type == SemanticType::Input
+            && z.start_y <= cursor.y
+            && cursor.y <= z.end_y
+    })?;
+
+    let logical = pane.get_logical_lines(zone.start_y..zone.end_y + 1);
+    let line = logical.into_iter().find(|l| l.contains_y(cursor.y))?;
+    let logical_len = line.logical.len();
+
+    // Map the zone's physical (x, y) corners onto the logical line so
+    // soft-wrapped commands are handled correctly.
+    let zone_start_lx = if line.contains_y(zone.start_y) {
+        line.xy_to_logical_x(zone.start_x, zone.start_y)
+            .min(logical_len)
+    } else {
+        0
+    };
+    let zone_end_lx = if line.contains_y(zone.end_y) {
+        // end_x is the inclusive last column of the zone; +1 makes it
+        // exclusive so `columns_as_str(..zone_end_lx)` stops past it.
+        line.xy_to_logical_x(zone.end_x.saturating_add(1), zone.end_y)
+            .min(logical_len)
+    } else {
+        logical_len
+    };
+
+    let cursor_lx = line
+        .xy_to_logical_x(cursor.x, cursor.y)
+        .clamp(zone_start_lx, zone_end_lx);
+
+    let left = line.logical.columns_as_str(zone_start_lx..cursor_lx);
+    let right = line.logical.columns_as_str(cursor_lx..zone_end_lx);
     Some((left, right))
 }

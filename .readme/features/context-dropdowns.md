@@ -1,6 +1,6 @@
 # Context Dropdowns
 
-**Status:** Active — v1 (cd) shipped; follow-ups not started
+**Status:** Active — v1 (cd) shipped; v2 (OSC 133 strict trigger for cd) shipped; follow-ups not started
 
 ## Overview
 
@@ -85,10 +85,49 @@ Left for the user to confirm on their setup:
 - [ ] `cd_picker_enabled = false` in `wezterm.lua` → Space always inserts normally
 - [ ] Works with `bash` / `fish` shells
 
-Known v1 imperfections (v2 will resolve via OSC 133 semantic zones):
+Known v1 imperfections (v2 resolves via OSC 133 semantic zones):
 
 - `echo cd ` + Space triggers the picker (cd as argument, not command). Escape dismisses.
 - `cd fo|o` with cursor mid-line triggers the picker (right-of-cursor check was dropped for RPROMPT compatibility).
+
+## v2 — OSC 133 strict trigger
+
+When the shell emits OSC 133 semantic-prompt markers (via wezterm's shell integration — see `docs/shell-integration.md` and `assets/shell-integration/`), the `cd` picker switches to a strict trigger path that resolves both known v1 imperfections.
+
+### How it works
+
+wezterm already parses OSC 133 into `SemanticZone`s (`Prompt` / `Input` / `Output`) reachable via `pane.get_semantic_zones()`. A new helper `split_input_zone_at_cursor` (in `overlay/context_dropdowns/mod.rs`) locates the `Input` zone containing the cursor and returns the zone's text to the left and right of the cursor — bypassing the PS1 prompt and any RPROMPT chrome entirely.
+
+The trigger then runs two strict checks on the Input zone contents:
+
+1. **First-token match** — the command's first whitespace-delimited token must be `cd`, with no second token. `echo cd` has `echo` as first token → rejected.
+2. **Trailing-edge cursor** — text to the right of the cursor within the zone must be empty / whitespace. `cd fo|o` has `o` to the right → rejected.
+
+### Fallback when OSC 133 is absent
+
+If no Input zone is found at the cursor (shell has no integration installed), the picker falls back to the v1 line-heuristic (last-token-is-`cd` check). Users without shell integration keep the v1 behavior, accepting its known false-positives; users with shell integration get the stricter v2.
+
+### Decisions
+
+| Decision | Choice | Why |
+|----------|--------|-----|
+| OSC 133 detection | Look for `SemanticType::Input` zone containing cursor | Presence = integration active; absence = unintegrated shell → fall back |
+| Fallback policy | v1 heuristic when OSC 133 absent | Keeps the picker working for unintegrated shells; strict behavior only enabled automatically when the data supports it |
+| Strict-path checks | First token AND right-of-cursor in zone | Both v1 imperfections come from not knowing command-vs-argument or zone bounds — OSC 133 gives us both |
+| No new config flag | Detection is automatic | One less knob; the behavior is strictly better when data is available |
+
+### Verification
+
+- [x] Unit tests: `is_cd_command_start` accepts `cd`, `  cd`, `cd `, rejects `echo cd`, `cd foo`, `cdx`
+- [x] `cargo build --bin wezterm-gui` passes
+- [x] `cargo test --bin wezterm-gui context_dropdowns` passes
+
+Left for the user to confirm on their setup (after sourcing wezterm's shell integration):
+
+- [ ] `echo cd ` + Space → no picker (strict path rejects; v1 fallback would have fired)
+- [ ] `cd fo|o` with cursor mid-argument → no picker
+- [ ] `cd` + Space at prompt → picker opens (strict path accepts)
+- [ ] Without shell integration (fresh shell, no `__wezterm_set_user_var` sourcing) → v1 heuristic still fires on `cd` + Space
 
 Pre-existing workspace-wide limitation:
 
