@@ -42,7 +42,8 @@ ben-term/
 
 | Feature | Spec | Description |
 |---------|------|-------------|
-| Context dropdowns | [features/context-dropdowns.md](features/context-dropdowns.md) | Native overlay pickers for cd, git checkout/stash, npm run/cargo, ssh, docker, kill, env — triggered by command + space. v1 in progress: `cd` only |
+| Context dropdowns | [features/context-dropdowns.md](features/context-dropdowns.md) | Shared infra (popup shell, trigger helpers) + `cd` picker. v1/v2/v3 shipped |
+| Git picker | [features/git-picker.md](features/git-picker.md) | `git <sub>` + Space dropdown. Phase 1 (refs: checkout/switch/merge/rebase/cherry-pick) in progress |
 
 ## Planned Features
 
