@@ -1,6 +1,6 @@
 # Context Dropdowns
 
-**Status:** Active — v1 (cd) shipped; v2 (OSC 133 strict trigger for cd) shipped; v3 (Modal popup rendering for cd) in progress
+**Status:** Active — v1 (cd) shipped; v2 (OSC 133 strict trigger for cd) shipped; v3 (Modal popup rendering for cd) shipped; follow-up pickers not started
 
 ## Overview
 
@@ -132,3 +132,70 @@ Left for the user to confirm on their setup (after sourcing wezterm's shell inte
 Pre-existing workspace-wide limitation:
 
 - `cargo clippy --workspace -- -D warnings` fails on unrelated upstream crates (`wezterm-char-props`, `config/src/background.rs`, etc.). This is pre-existing debt in the WezTerm fork and out of scope for this feature.
+
+## v3 — Modal popup rendering
+
+v1 and v2 ran the picker inside a full-pane `TermWizTerminal` overlay (`start_overlay_pane`) which visually replaced the entire shell pane. v3 rebuilds it as a floating popup on top of wezterm's existing `Modal` trait — the same render path the built-in command palette uses. The shell prompt and surrounding output stay visible behind the picker.
+
+### How it works
+
+`CdPicker` implements `Modal` in `wezterm-gui/src/overlay/context_dropdowns/cd_picker.rs`. On trigger, `cd::try_activate` snapshots the cursor's viewport `(col, row)` from `pane.get_cursor_position()` / `pane.get_dimensions().physical_top`, gathers candidates synchronously as before, then calls `term_window.set_modal(Rc::new(CdPicker::new(entries, pane_id, cursor_col, cursor_viewport_row)))`.
+
+Paint integration is entirely in upstream `paint_modal` (`render/paint.rs`), which composites the picker's `ComputedElement` at zindex 100 after the pane render pass. Keystrokes bypass the PTY while the modal is installed because `TermWindow::key_event_impl` routes to `modal.key_down` when one exists. The picker's own `key_down` handles arrows / filter editing / Enter / Escape / Ctrl-C+G+U and returns `Ok(true)` to consume them.
+
+### Positioning & sizing
+
+```
+anchor_x = min(
+    padding_left + cursor_col * cell_w,
+    padding_left + avail_pixel_width - desired_pixel_width
+).max(padding_left)
+anchor_y = top_bar_height + padding_top + os_border.top + (cursor_viewport_row + 1) * cell_h
+width   = 50 cols * cell_w         (clamped to available columns)
+border  = 1px, color = command_palette_fg_color
+corners = 0.5 cells, rounded (TOP_*_ROUNDED_CORNER / BOTTOM_*_ROUNDED_CORNER polys)
+padding = 0.5 cell horizontal, 0.25 cell vertical
+colors  = reuses command_palette_{bg,fg}_color
+font    = reuses command_palette_font
+```
+
+Anchored below and left-aligned to the cursor so the popup feels like a contextual dropdown instead of a centered palette. Width is fixed at 50 cols — path labels remain legible without dominating the pane. Clamped against the right edge on narrow windows.
+
+### Decisions
+
+| Decision | Choice | Why |
+|----------|--------|-----|
+| Render mechanism | Implement `Modal` trait | Only popup-capable primitive in the codebase; upstream already composites `Modal`s at zindex 100 with no pane replacement |
+| Parallel vs. shared | Parallel to `palette.rs`, zero shared code | Keeps our divergence isolated so upstream palette changes don't ripple in |
+| Anchor | Below + left-aligned to shell cursor | Matches "dropdown" affordance; follows the typed `cd ` insertion point |
+| Anchor clamp | Right-edge clamp, cursor-row clamp to `max(0)` | Avoid clipping off-screen when the cursor is near the right or scrolled above viewport |
+| Width | Fixed 50 cols (clamped to available) | Reads comfortably; leaves the shell context visible on both sides |
+| Style | Reuse `command_palette_{fg,bg}_color` / font | No new user-visible config; matches wezterm popup aesthetic |
+| Filter cursor | Keep v2's full editor (Left/Right/Home/End/Delete/Ctrl-{U,A,E,B,F,G,C,K,J,N,P}) | User-visible regression if dropped |
+| Cursor display | Underscore at insertion point inside the header `>` line | Trivial; no separate caret primitive |
+| Double-trigger guard | `TermWindow::has_modal()` check in `try_activate` | Duplicate Space events can't stack a second modal on top of the first |
+| Source pane | `CdPicker` stores `PaneId` at construction; resolves via `Mux::get().get_pane` on Enter | Pane identity is stable for the modal's lifetime |
+| Deleted code | Retired `picker.rs` (raw-mode input loop on `TermWizTerminal`) | No longer needed — Modal path owns input and render |
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `wezterm-gui/src/overlay/context_dropdowns/cd_picker.rs` | **New**. `CdPicker` + `PickerEntry` + `Modal` impl + all filter-cursor tests |
+| `wezterm-gui/src/overlay/context_dropdowns/cd.rs` | Swap `start_overlay_pane` block for `term_window.set_modal(…)`. Add `has_modal` guard. Drop `run_cd_picker`, `TermWizTerminal`, `promise::spawn` imports. `shell_quote` becomes `pub(super)` so the Modal's `Enter` handler can use it |
+| `wezterm-gui/src/overlay/context_dropdowns/mod.rs` | `pub mod picker` → `pub mod cd_picker` |
+| `wezterm-gui/src/overlay/context_dropdowns/picker.rs` | **Deleted** (~360 lines) |
+| `wezterm-gui/src/termwindow/mod.rs` | Minimal upstream exposure: fields `fonts`, `show_tab_bar`, `render_state` become `pub`; `invalidate_modal` becomes `pub`; new `pub fn has_modal()` and `pub fn terminal_size()`. All mirror the access upstream Modal siblings (palette/charselect/paneselect) already have inside the module |
+
+### Verification
+
+- [x] `cargo build --bin wezterm-gui` passes
+- [x] `cargo test --bin wezterm-gui context_dropdowns` — 20/20 passing (all v1 + v2 tests preserved; `enter_resolves_selected_entry` and `selected_value_is_none_when_no_matches` added)
+- [x] `cargo clippy --no-deps -p wezterm-gui` clean on our module (pre-existing workspace debt in `inputmap.rs` unchanged, out of scope)
+- [x] Manual QA: popup opens below the shell cursor, half-width, rounded border visible; shell prompt + output still visible around it; Enter pastes `cd <path>`; Escape dismisses; Resize while open relayouts
+
+### Known follow-ups (out of scope for v3)
+
+- Click-away dismiss (palette doesn't do it either — would add in `Modal::mouse_event`)
+- If cursor is near the bottom of the window, the popup may extend below the visible grid. Could flip to anchor *above* cursor on that edge case — deferred until it bites
+- Pane cursor stays visible under the popup (palette precedent). Fine for now; can be hidden via a cursor-visibility hook if it visually clashes
