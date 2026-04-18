@@ -435,13 +435,15 @@ pub struct Config {
     #[dynamic(default = "default_num_alphabet")]
     pub launcher_alphabet: String,
 
-    // Context dropdowns (ben-term custom) — v1: cd picker
+    // Context dropdowns (ben-term custom) — v1: cd picker; Phase 1: git picker
     #[dynamic(default = "default_true")]
     pub cd_picker_enabled: bool,
     #[dynamic(default = "default_cd_picker_max_depth")]
     pub cd_picker_max_depth: u8,
     #[dynamic(default = "default_true")]
     pub cd_picker_include_home: bool,
+    #[dynamic(default = "default_true")]
+    pub git_picker_enabled: bool,
 
     #[dynamic(default)]
     pub disable_default_quick_select_patterns: bool,

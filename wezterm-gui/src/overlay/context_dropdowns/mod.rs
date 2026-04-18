@@ -8,7 +8,8 @@
 //! Isolated from upstream overlay code to keep rebases clean.
 
 pub mod cd;
-pub mod cd_picker;
+pub mod git;
+pub mod popup_picker;
 
 use mux::pane::Pane;
 use std::sync::Arc;
@@ -92,4 +93,58 @@ pub fn split_input_zone_at_cursor(pane: &Arc<dyn Pane>) -> Option<(String, Strin
     let left = line.logical.columns_as_str(zone_start_lx..cursor_lx);
     let right = line.logical.columns_as_str(cursor_lx..zone_end_lx);
     Some((left, right))
+}
+
+/// Single-quote the value unless it's already safe bare-word shell text.
+/// Embedded `'` is handled via the `'\''` concat trick.
+///
+/// Shared by all context-dropdown pickers that paste a value into the shell.
+/// Applied defensively even for inputs that shouldn't need it (e.g. git ref
+/// names forbid spaces and quotes) so a pathological candidate source can't
+/// produce shell injection.
+pub(super) fn shell_quote(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '/' | '.' | '_' | '-' | '~' | '=' | ':' | '+' | '@')
+        });
+    if safe {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_safe_paths_unchanged() {
+        assert_eq!(shell_quote("/tmp/foo"), "/tmp/foo");
+        assert_eq!(shell_quote(".."), "..");
+        assert_eq!(shell_quote("~"), "~");
+        assert_eq!(shell_quote("/Users/a/b-c.d_e"), "/Users/a/b-c.d_e");
+        assert_eq!(shell_quote("main"), "main");
+        assert_eq!(shell_quote("feature/foo"), "feature/foo");
+    }
+
+    #[test]
+    fn quote_paths_with_spaces() {
+        assert_eq!(shell_quote("/has space"), "'/has space'");
+    }
+
+    #[test]
+    fn quote_paths_with_single_quotes() {
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
 }

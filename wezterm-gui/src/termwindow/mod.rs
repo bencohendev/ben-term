@@ -3182,19 +3182,20 @@ impl TermWindow {
             InputSelector(args) => self.show_input_selector(args),
             Confirmation(args) => self.show_confirmation(args),
             ActivateContextDropdown(kind) => {
+                use crate::overlay::context_dropdowns::{cd, git, TriggerResult};
                 use config::keyassignment::ContextDropdownKind;
+                // The `Cd` variant is historical — it's the "try each of our
+                // context pickers in order" dispatch. Chain cd → git → future
+                // phases (stash, files, remotes) as they land.
                 let result = match kind {
-                    ContextDropdownKind::Cd => {
-                        crate::overlay::context_dropdowns::cd::try_activate(self, pane)
-                    }
+                    ContextDropdownKind::Cd => match cd::try_activate(self, pane) {
+                        TriggerResult::Launched => TriggerResult::Launched,
+                        TriggerResult::PassThrough => git::try_activate(self, pane),
+                    },
                 };
                 return Ok(match result {
-                    crate::overlay::context_dropdowns::TriggerResult::Launched => {
-                        PerformAssignmentResult::Handled
-                    }
-                    crate::overlay::context_dropdowns::TriggerResult::PassThrough => {
-                        PerformAssignmentResult::Unhandled
-                    }
+                    TriggerResult::Launched => PerformAssignmentResult::Handled,
+                    TriggerResult::PassThrough => PerformAssignmentResult::Unhandled,
                 });
             }
         };

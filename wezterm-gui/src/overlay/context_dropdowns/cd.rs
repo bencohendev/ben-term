@@ -19,7 +19,7 @@
 //! On select, `~` is resolved to the absolute home path before insertion to
 //! avoid bracketed-paste expansion inconsistencies across shells.
 
-use crate::overlay::context_dropdowns::cd_picker::{CdPicker, PickerEntry};
+use crate::overlay::context_dropdowns::popup_picker::{PickerEntry, PopupPicker};
 use crate::overlay::context_dropdowns::{
     split_input_zone_at_cursor, split_logical_line_at_cursor, TriggerResult,
 };
@@ -100,12 +100,19 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
     let dims = pane.get_dimensions();
     let cursor_viewport_row = cursor.y - dims.physical_top;
 
-    term_window.set_modal(Rc::new(CdPicker::new(
+    term_window.set_modal(Rc::new(PopupPicker::new(
         entries,
         pane_id,
         cursor.x,
         cursor_viewport_row,
     )));
+    // The Space that triggered us was consumed by the KeyAssignment. Echo it
+    // back into the shell so the command line reads `cd ` and subsequent
+    // filter chars append correctly (see `PopupPicker::forward_to_pane`).
+    let _ = pane.key_down(
+        wezterm_term::KeyCode::Char(' '),
+        wezterm_term::KeyModifiers::NONE,
+    );
     TriggerResult::Launched
 }
 
@@ -305,32 +312,6 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Single-quote the path unless it's already safe bare-word shell text.
-/// Embedded `'` is handled via the `'\''` concat trick.
-///
-/// `pub(super)` so `cd_picker::CdPicker::key_down` can reuse it on Enter.
-pub(super) fn shell_quote(s: &str) -> String {
-    let safe = !s.is_empty()
-        && s.chars().all(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(c, '/' | '.' | '_' | '-' | '~' | '=' | ':' | '+' | '@')
-        });
-    if safe {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,21 +405,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn quote_safe_paths_unchanged() {
-        assert_eq!(shell_quote("/tmp/foo"), "/tmp/foo");
-        assert_eq!(shell_quote(".."), "..");
-        assert_eq!(shell_quote("~"), "~");
-        assert_eq!(shell_quote("/Users/a/b-c.d_e"), "/Users/a/b-c.d_e");
-    }
-
-    #[test]
-    fn quote_paths_with_spaces() {
-        assert_eq!(shell_quote("/has space"), "'/has space'");
-    }
-
-    #[test]
-    fn quote_paths_with_single_quotes() {
-        assert_eq!(shell_quote("it's"), "'it'\\''s'");
-    }
 }
