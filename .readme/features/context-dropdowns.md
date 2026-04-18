@@ -1,6 +1,6 @@
 # Context Dropdowns
 
-**Status:** Active — v1 (cd) shipped; v2 (OSC 133 strict trigger for cd) shipped; v3 (Modal popup rendering for cd) shipped; follow-up pickers not started
+**Status:** Active — v1/v2/v3 shipped for `cd`; `PopupPicker` (shared popup shell) and PTY-echo input model shipped alongside git picker Phase 1. Spec now primarily covers shared infrastructure + the cd picker; per-command pickers live in their own specs (see [git-picker.md](git-picker.md)).
 
 ## Overview
 
@@ -10,7 +10,7 @@ Native overlay pickers that appear inline when the user types a recognized comma
 
 **v1 — this spec:** `cd` picker only.
 
-**Planned follow-ups (separate future specs):** `git checkout` / `git stash`, `npm run` / `cargo`, `ssh`, `docker`, `kill`, `env`.
+**Planned follow-ups (separate future specs):** `npm run` / `cargo`, `ssh`, `docker`, `kill`, `env`. (`git` pickers now live in [git-picker.md](git-picker.md); Phase 1 — ref-taking subcommands — shipped.)
 
 The v1 module layout (`wezterm-gui/src/overlay/context_dropdowns/`) is designed so each follow-up picker adds a sibling file (`git.rs`, `npm.rs`, …) reusing shared trigger-parsing and guard-chain infrastructure from `mod.rs`.
 
@@ -171,8 +171,8 @@ Anchored below and left-aligned to the cursor so the popup feels like a contextu
 | Anchor clamp | Right-edge clamp, cursor-row clamp to `max(0)` | Avoid clipping off-screen when the cursor is near the right or scrolled above viewport |
 | Width | Fixed 50 cols (clamped to available) | Reads comfortably; leaves the shell context visible on both sides |
 | Style | Reuse `command_palette_{fg,bg}_color` / font | No new user-visible config; matches wezterm popup aesthetic |
-| Filter cursor | Keep v2's full editor (Left/Right/Home/End/Delete/Ctrl-{U,A,E,B,F,G,C,K,J,N,P}) | User-visible regression if dropped |
-| Cursor display | Underscore at insertion point inside the header `>` line | Trivial; no separate caret primitive |
+| Filter cursor | Keep v2's full editor (Left/Right/Home/End/Delete/Ctrl-{U,A,E,B,F,G,C,K,J,N,P}) | User-visible regression if dropped. **Superseded by PTY-echo — see section below.** |
+| Cursor display | Underscore at insertion point inside the header `>` line | Trivial; no separate caret primitive. **Superseded by PTY-echo — the shell cursor is the real cursor; popup no longer renders a header.** |
 | Double-trigger guard | `TermWindow::has_modal()` check in `try_activate` | Duplicate Space events can't stack a second modal on top of the first |
 | Source pane | `CdPicker` stores `PaneId` at construction; resolves via `Mux::get().get_pane` on Enter | Pane identity is stable for the modal's lifetime |
 | Deleted code | Retired `picker.rs` (raw-mode input loop on `TermWizTerminal`) | No longer needed — Modal path owns input and render |

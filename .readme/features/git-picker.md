@@ -33,12 +33,12 @@ Phase 1 covers the ref-taking subcommands — `checkout`, `switch`, `merge`, `re
 | Repo detection | Empty stdout or non-zero exit → PassThrough (no picker) | Covers "not a git repo" and "empty repo" without a separate `rev-parse` |
 | Budget | 250 ms wall-clock on the shell-out | for-each-ref is milliseconds on real repos; cap guards against stuck HEAD / network fs |
 | Git binary lookup | `git`, `/opt/homebrew/bin/git`, `/usr/local/bin/git` — same fallback as `zoxide_query` in cd.rs | macOS GUI apps don't inherit shell PATH |
-| Paste on select | ` <ref>` with defensive `shell_quote` | Git ref names forbid spaces and quotes in practice; shell_quote is a safety net |
+| Paste on select | `<ref>` with defensive `shell_quote`, no leading space | Trigger Space is already echoed into the shell by the PTY-echo model (see context-dropdowns.md); leading space would double it. Git ref names forbid spaces and quotes in practice, but shell_quote is kept as a safety net |
 | Guards | Alt-screen / pane overlay / existing modal — identical to cd | Same failure modes |
 
 ## Architecture
 
-### Files (during implementation)
+### Files
 
 | File | Change |
 |------|--------|
@@ -63,13 +63,17 @@ Unit tests (`cargo test --bin wezterm-gui context_dropdowns`):
 - `detect_git_ref_subcommand_heuristic` accepts the same cases preceded by arbitrary prompt text (`"~ $ git checkout"`, `"user@host:~ $ git merge"`); rejects third-token-present and non-whitelisted subcommands
 
 Manual QA (inside wezterm):
-- [ ] Inside a git repo: `git checkout ` + Space → popup shows local branches + tags
-- [ ] Enter → buffer contains `git checkout <ref>` (no execution)
-- [ ] `git switch`, `git merge`, `git rebase`, `git cherry-pick` all trigger
+- [x] Inside a git repo: `git checkout ` + Space → popup shows local branches + tags
+- [x] Enter → buffer contains `git checkout <ref>` (no execution)
+- [x] Filter typing echoes into the shell AND narrows the popup live (PTY-echo model)
+- [x] Backspace past an empty filter backs out the trigger Space, closing the popup
+
+Left for further confirmation:
+- [ ] `git switch`, `git merge`, `git rebase`, `git cherry-pick` all trigger (structurally identical; only `checkout` exercised during initial QA)
 - [ ] `git status` + Space → Space inserts normally, no popup
 - [ ] `git checkout foo` + Space → no popup (strict path: third token present)
 - [ ] Outside a git repo (e.g. `cd /tmp`) → Space inserts normally, no popup
-- [ ] `cd` + Space still opens the cd picker (cd dispatch untouched)
+- [x] `cd` + Space still opens the cd picker (cd dispatch untouched)
 - [ ] `git_picker_enabled = false` in wezterm.lua → Space always falls through on `git <sub>`
 - [ ] Large repo: popup opens without perceptible lag, fuzzy filter is snappy
 
