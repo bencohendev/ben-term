@@ -1,6 +1,6 @@
 # Git Picker
 
-**Status:** Active — Phase 1 (refs for checkout/switch/merge/rebase/cherry-pick) in progress
+**Status:** Active — Phase 1 (refs for checkout/switch/merge/rebase/cherry-pick) shipped; phases 2–4 not started
 
 ## Overview
 

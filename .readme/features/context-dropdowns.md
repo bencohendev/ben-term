@@ -199,3 +199,30 @@ Anchored below and left-aligned to the cursor so the popup feels like a contextu
 - Click-away dismiss (palette doesn't do it either — would add in `Modal::mouse_event`)
 - If cursor is near the bottom of the window, the popup may extend below the visible grid. Could flip to anchor *above* cursor on that edge case — deferred until it bites
 - Pane cursor stays visible under the popup (palette precedent). Fine for now; can be hidden via a cursor-visibility hook if it visually clashes
+
+## Shared `PopupPicker` — PTY-echo input model (shipped alongside git picker Phase 1)
+
+During the git picker work the popup's input handling was reworked so the shell remains the "real" cursor. This change applies to every picker that uses `PopupPicker` (cd, git, future phases).
+
+### Behavior
+
+- The popup no longer renders a `> <filter>` header. Only the candidate list is shown.
+- The trigger (`cd` / `git <sub>`) re-sends the consumed Space to the PTY, so the shell command line shows e.g. `cd ` with a trailing space once the popup opens.
+- Typed filter characters are both (a) appended to the popup's internal filter used for fuzzy ranking, and (b) forwarded to the PTY via `Pane::key_down` so they echo into the shell's command line in real time.
+- Backspace/Delete likewise pop the filter and forward a Backspace to the PTY, keeping the command line and popup filter in sync. On an empty filter, Backspace closes the popup AND still forwards so the user can keep rubbing out the trigger text (`cd ` then `cd` etc.).
+- Ctrl-U clears the filter and sends N Backspaces to the PTY.
+- Enter sends N Backspaces (to rub out the filter chars we echoed) then pastes `shell_quote(value)` — no leading space since it's already in the shell from the trigger.
+- Escape closes the popup and leaves whatever the user typed visible in the shell.
+
+### Code changes
+
+- Dropped `filter_cursor` field + all positional editing (`filter_left/right/home/end/filter_delete` + Ctrl-A/E/B/F handlers). The popup is append-only now; positional edits happen in the shell.
+- Added `PopupPicker::forward_to_pane(key, mods)` and `PopupPicker::send_backspaces(n)` helpers.
+- `cd::try_activate` and `git::try_activate` now call `pane.key_down(KeyCode::Char(' '), KeyModifiers::NONE)` immediately after `set_modal`.
+- Enter handler pastes without the leading space.
+
+### Why this is better
+
+- "Where is the cursor?" has one answer: the shell. No dual-cursor confusion.
+- The command line is the source of truth — if the user Escapes, they still see what they typed and can edit / submit it manually.
+- Backspace past the trigger naturally backs out the whole interaction one character at a time.
