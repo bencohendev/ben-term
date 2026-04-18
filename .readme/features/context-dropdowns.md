@@ -1,6 +1,6 @@
 # Context Dropdowns
 
-**Status:** Active — v1/v2/v3 shipped for `cd`; `PopupPicker` (shared popup shell) and PTY-echo input model shipped alongside git picker Phase 1. Spec now primarily covers shared infrastructure + the cd picker; per-command pickers live in their own specs (see [git-picker.md](git-picker.md)).
+**Status:** Active — v1/v2/v3 shipped for `cd`; `PopupPicker` (shared popup shell), PTY-echo input model, and instant-open / async-loading candidate gather shipped alongside git picker Phase 1. Spec now primarily covers shared infrastructure + the cd picker; per-command pickers live in their own specs (see [git-picker.md](git-picker.md)).
 
 ## Overview
 
@@ -26,7 +26,7 @@ The v1 module layout (`wezterm-gui/src/overlay/context_dropdowns/`) is designed 
 | After select | Paste ` /path` (leading space, no newline) | User already typed `cd`; we only append the argument. User confirms with Enter |
 | `~` handling | Resolve to absolute `$HOME` before insert | Avoids bracketed-paste expansion inconsistency across shells |
 | Path quoting | Shell-quote paths with spaces / special chars | Correctness |
-| Candidate gather | Sync on main thread before mounting overlay | Keeps initial render non-blank; BFS walker + zoxide is typically <500 ms |
+| Candidate gather | Async on worker thread, modal opens instantly with "Loading…" placeholder | The ~100–500 ms zoxide + BFS walk was perceptible lag between Space and popup appearing. Results swap in via `TermWindowNotif::Apply` when ready. Prior v1–v3 behavior was sync-on-main-thread |
 | Dir walker | Hand-rolled BFS over `std::fs::read_dir` | `walkdir`'s DFS exhausts the budget on the first huge subtree (`~/Desktop`, `~/Documents`); BFS guarantees depth-N coverage before any depth-N+1 descent |
 | Walk scope | $HOME depth 5 always; CWD depth 1-3 if outside $HOME | Projects live in $HOME; depth 5 covers typical monorepo nesting |
 | Walk budget | 500 ms wall-clock OR 10 000 entries | Bounded cost; caps huge homes |
@@ -226,3 +226,47 @@ During the git picker work the popup's input handling was reworked so the shell 
 - "Where is the cursor?" has one answer: the shell. No dual-cursor confusion.
 - The command line is the source of truth — if the user Escapes, they still see what they typed and can edit / submit it manually.
 - Backspace past the trigger naturally backs out the whole interaction one character at a time.
+
+## Instant-open / async-loading candidate gather
+
+Originally `cd::try_activate` gathered candidates synchronously on the main thread before calling `set_modal`, so users perceived a ~100–500 ms stall between pressing Space and the popup appearing. The zoxide subprocess + `$HOME` BFS walk (up to 500 ms budget, 10 000 entries) is the dominant cost. Moving it off the critical path makes the popup feel instantaneous.
+
+### Behavior
+
+- Popup opens immediately on Space with an empty candidate list and a `Loading…` placeholder row (instead of the false-negative `(no matches)`).
+- A worker thread runs `gather_candidates`; when it finishes, it posts a closure back to the main thread via `window.notify(TermWindowNotif::Apply(...))`. The closure downcasts the current modal to `PopupPicker` and calls `set_entries_loaded` to swap entries in + invalidate cached match list + trigger a repaint.
+- Any filter text the user typed during the load is preserved — `set_entries_loaded` clears the cached `MatchResults` so the first render after the swap re-fuzzies the fresh entries against the already-typed filter.
+- If the user dismisses the popup (Escape) or re-triggers cd before the gather returns, the stale results are silently discarded. Each `PopupPicker` has a monotonic `id` (atomic counter); the background closure captures the id it was spawned for and only applies results when the currently-installed modal's id matches.
+
+### Code changes
+
+- `PopupPicker` gains:
+  - `entries: RefCell<Vec<PickerEntry>>` (was a plain `Vec`) so a deferred loader can replace them in place.
+  - `loading: RefCell<bool>` — renders `Loading…` when true + entries empty.
+  - `id: u64` + `fn id(&self)` — per-activation identity for stale-result guard.
+  - `fn new_loading(...)` — constructs in loading state with no entries.
+  - `fn set_entries_loaded(entries)` — swaps in entries, clears `loading`, invalidates `matches`/`element` caches.
+- `cd::try_activate` now calls `set_modal` immediately, echoes the trigger space, and spawns `promise::spawn::spawn_into_new_thread` for the gather. The notify closure locates the picker via `TermWindow::get_modal().downcast_ref::<PopupPicker>()` and only applies if `picker.id() == captured_id`.
+- `TermWindow::get_modal` is now `pub` (like `invalidate_modal` / `has_modal`) so the notify closure can access the installed modal.
+
+### Decisions
+
+| Decision | Choice | Why |
+|----------|--------|-----|
+| Main-thread mutation only | `RefCell` on `entries`/`loading`; cross-thread work hops back via `TermWindowNotif::Apply` | `PopupPicker` lives in `Rc<dyn Modal>` which is `!Send`. The notify closure runs on the main thread so RefCell is safe; no new locking primitives needed |
+| Stale-result guard | Per-activation monotonic `id` compared before applying | User can Escape and reopen cd while the first gather is in flight; the id mismatch makes the old result a no-op instead of corrupting the new picker |
+| Loading placeholder | Single `Loading…` row (not a spinner) | Gather completes in ≤500 ms budget, so an animated spinner is overkill; a static label is zero render cost |
+| No cancellation | Background task always runs to completion | The gather is short, bounded, and side-effect-free. Building a cancellation channel for ≤500 ms of work is over-engineering |
+
+### Verification
+
+- [x] `cargo build --bin wezterm-gui` passes
+- [x] `cargo build --release --bin wezterm-gui` passes
+- [x] `cargo test --bin wezterm-gui context_dropdowns` — 28/28 passing
+- [x] `cargo clippy --no-deps -p wezterm-gui -- -D warnings` — our module clean (pre-existing `bind-instead-of-map` error in `wezterm-gui/build.rs` is unchanged upstream debt, out of scope)
+
+Left for the user to confirm on their setup:
+
+- [ ] `cd` + Space → popup appears instantly (no perceptible lag), briefly shows `Loading…`, then populates
+- [ ] Type filter chars while `Loading…` is shown → when entries arrive, list is already filtered to match
+- [ ] `cd` + Space, Escape quickly, `cd` + Space again → no stale results bleed into the second popup

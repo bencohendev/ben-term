@@ -23,12 +23,13 @@ use crate::overlay::context_dropdowns::popup_picker::{PickerEntry, PopupPicker};
 use crate::overlay::context_dropdowns::{
     split_input_zone_at_cursor, split_logical_line_at_cursor, TriggerResult,
 };
-use crate::termwindow::TermWindow;
+use crate::termwindow::{TermWindow, TermWindowNotif};
 use mux::pane::Pane;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use window::WindowOps;
 
 const WALK_BUDGET: Duration = Duration::from_millis(500);
 const WALK_MAX_ENTRIES: usize = 10_000;
@@ -89,10 +90,6 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
     let include_home = cfg.cd_picker_include_home;
     let pane_id = pane.pane_id();
 
-    // Gather on the main thread so the first render has content. Budget-capped
-    // BFS walk + zoxide is typically <500 ms.
-    let entries = gather_candidates(cwd.as_deref(), home.as_deref(), max_depth, include_home);
-
     // Snapshot the cursor's viewport position so the popup can anchor just
     // below and left-aligned to the typed `cd ` insertion point. Input is
     // captured while the modal is open, so this snapshot stays valid.
@@ -100,12 +97,13 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
     let dims = pane.get_dimensions();
     let cursor_viewport_row = cursor.y - dims.physical_top;
 
-    term_window.set_modal(Rc::new(PopupPicker::new(
-        entries,
-        pane_id,
-        cursor.x,
-        cursor_viewport_row,
-    )));
+    // Open the popup instantly in a "loading" state — the candidate gather
+    // (zoxide subprocess + BFS walk of $HOME) can take a few hundred ms and
+    // users perceive that as lag. Gathering runs on a worker thread and the
+    // results are swapped in via `TermWindowNotif::Apply` when ready.
+    let picker = PopupPicker::new_loading(pane_id, cursor.x, cursor_viewport_row);
+    let picker_id = picker.id();
+    term_window.set_modal(Rc::new(picker));
     // The Space that triggered us was consumed by the KeyAssignment. Echo it
     // back into the shell so the command line reads `cd ` and subsequent
     // filter chars append correctly (see `PopupPicker::forward_to_pane`).
@@ -113,6 +111,46 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
         wezterm_term::KeyCode::Char(' '),
         wezterm_term::KeyModifiers::NONE,
     );
+
+    // Background gather. Values captured into the closure must be `Send`;
+    // `PopupPicker` itself is `!Send` (it lives in `Rc`), so we don't touch
+    // it from this thread — we post a closure back to the main thread
+    // through `TermWindowNotif::Apply` which then locates the picker via
+    // `get_modal().downcast_ref()`.
+    let window = term_window.window.clone();
+    let cwd_buf = cwd.map(|p| p.to_path_buf());
+    let home_buf = home;
+    // `.detach()` so the task runs to completion even though we don't await
+    // it — dropping the returned `Task` would cancel the gather.
+    promise::spawn::spawn_into_new_thread(move || -> anyhow::Result<()> {
+        let entries = gather_candidates(
+            cwd_buf.as_deref(),
+            home_buf.as_deref(),
+            max_depth,
+            include_home,
+        );
+        if let Some(window) = window {
+            window.notify(TermWindowNotif::Apply(Box::new(
+                move |tw: &mut TermWindow| {
+                    // Guard against a stale result landing in a newer picker:
+                    // if the user Escaped and reopened cd before we finished,
+                    // the current modal (if any) has a different id and we
+                    // silently drop our results.
+                    if let Some(modal) = tw.get_modal() {
+                        if let Some(picker) = modal.downcast_ref::<PopupPicker>() {
+                            if picker.id() == picker_id {
+                                picker.set_entries_loaded(entries);
+                                tw.invalidate_modal();
+                            }
+                        }
+                    }
+                },
+            )));
+        }
+        Ok(())
+    })
+    .detach();
+
     TriggerResult::Launched
 }
 

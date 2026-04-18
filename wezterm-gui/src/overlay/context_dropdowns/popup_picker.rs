@@ -28,8 +28,16 @@ use config::{Dimension, DimensionContext};
 use mux::pane::PaneId;
 use rayon::prelude::*;
 use std::cell::{Ref, RefCell};
+use std::sync::atomic::{AtomicU64, Ordering};
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent};
 use window::color::LinearRgba;
+
+/// Monotonic counter for per-activation picker IDs. Used so a background
+/// gather task can check whether the currently-installed modal is the one
+/// it was spawned for — guards against a stale result landing in a newer
+/// picker (e.g. user opens cd, Escapes, opens cd again before the first
+/// gather returns).
+static NEXT_PICKER_ID: AtomicU64 = AtomicU64::new(0);
 
 /// One candidate row in the picker.
 #[derive(Debug, Clone)]
@@ -47,7 +55,18 @@ struct MatchResults {
 }
 
 pub struct PopupPicker {
-    entries: Vec<PickerEntry>,
+    /// Per-activation identity. Background loaders compare this against the
+    /// current modal's id before applying results, so stale loads from a
+    /// dismissed-and-reopened picker can't bleed into a fresh one.
+    id: u64,
+    /// Candidate list. `RefCell` so async pickers (e.g. cd) can swap in a
+    /// freshly-gathered list via `set_entries_loaded` after the modal is
+    /// already on screen. Mutation only happens on the main thread.
+    entries: RefCell<Vec<PickerEntry>>,
+    /// True while an async gather is in flight. When true with an empty
+    /// entry list, the popup renders a "Loading…" placeholder instead of
+    /// "(no matches)" so the user sees that results are still coming.
+    loading: RefCell<bool>,
     source_pane_id: PaneId,
     /// Viewport column of the shell cursor at trigger time (used to anchor
     /// the popup just below/left-aligned to the typed `cd ` insertion point).
@@ -75,8 +94,45 @@ impl PopupPicker {
         cursor_col: usize,
         cursor_viewport_row: isize,
     ) -> Self {
-        Self {
+        Self::with_state(
             entries,
+            false,
+            source_pane_id,
+            cursor_col,
+            cursor_viewport_row,
+        )
+    }
+
+    /// Construct in a "loading" state with no entries yet. The caller is
+    /// expected to call `set_entries_loaded` on the main thread once the
+    /// candidates finish gathering (typically via a `TermWindowNotif::Apply`
+    /// posted from a background thread). This lets the modal appear
+    /// instantly while the expensive gather runs off the main thread.
+    pub fn new_loading(
+        source_pane_id: PaneId,
+        cursor_col: usize,
+        cursor_viewport_row: isize,
+    ) -> Self {
+        Self::with_state(
+            Vec::new(),
+            true,
+            source_pane_id,
+            cursor_col,
+            cursor_viewport_row,
+        )
+    }
+
+    fn with_state(
+        entries: Vec<PickerEntry>,
+        loading: bool,
+        source_pane_id: PaneId,
+        cursor_col: usize,
+        cursor_viewport_row: isize,
+    ) -> Self {
+        Self {
+            id: NEXT_PICKER_ID.fetch_add(1, Ordering::Relaxed),
+            entries: RefCell::new(entries),
+            loading: RefCell::new(loading),
             source_pane_id,
             cursor_col,
             cursor_viewport_row,
@@ -87,6 +143,24 @@ impl PopupPicker {
             element: RefCell::new(None),
             max_rows_on_screen: RefCell::new(0),
         }
+    }
+
+    /// Swap in a freshly-loaded entry list and mark the picker as no longer
+    /// loading. Invalidates cached match list + element so the next render
+    /// re-fuzzies against the current filter (which the user may have typed
+    /// into while the gather was running).
+    pub fn set_entries_loaded(&self, entries: Vec<PickerEntry>) {
+        *self.entries.borrow_mut() = entries;
+        *self.loading.borrow_mut() = false;
+        self.matches.borrow_mut().take();
+        self.element.borrow_mut().take();
+    }
+
+    /// Per-activation identity. Callers spawning async work capture this
+    /// when the picker is constructed and use it on completion to verify
+    /// they're still talking to the same picker instance.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     fn updated_input(&self) {
@@ -110,7 +184,7 @@ impl PopupPicker {
             .borrow()
             .as_ref()
             .map(|m| m.matches.len())
-            .unwrap_or_else(|| self.entries.len())
+            .unwrap_or_else(|| self.entries.borrow().len())
             .saturating_sub(1);
         let mut row = self.selected_row.borrow_mut();
         *row = row.saturating_add(1).min(limit);
@@ -162,7 +236,7 @@ impl PopupPicker {
         let matches = self.matches.borrow();
         let results = matches.as_ref()?;
         let entry_idx = *results.matches.get(selected_idx)?;
-        self.entries.get(entry_idx).map(|e| e.value.clone())
+        self.entries.borrow().get(entry_idx).map(|e| e.value.clone())
     }
 
     fn compute(
@@ -171,7 +245,9 @@ impl PopupPicker {
         matches: &MatchResults,
         max_rows_on_screen: usize,
     ) -> anyhow::Result<Vec<ComputedElement>> {
-        let entries = self.entries.as_slice();
+        let entries_ref = self.entries.borrow();
+        let entries = entries_ref.as_slice();
+        let is_loading = *self.loading.borrow();
         let selected_row = *self.selected_row.borrow();
         let top_row = *self.top_row.borrow();
         let font = term_window
@@ -206,8 +282,16 @@ impl PopupPicker {
         let mut rows: Vec<Element> = Vec::new();
 
         if matches.matches.is_empty() {
+            // Show "Loading…" while an async gather is still in flight so the
+            // instant-open popup communicates "results are coming" instead of
+            // the false-negative "(no matches)".
+            let placeholder = if is_loading {
+                "  Loading…"
+            } else {
+                "  (no matches)"
+            };
             rows.push(
-                Element::new(&font, ElementContent::Text("  (no matches)".to_string()))
+                Element::new(&font, ElementContent::Text(placeholder.to_string()))
                     .colors(ElementColors {
                         border: BorderColor::default(),
                         bg: LinearRgba::TRANSPARENT.into(),
@@ -476,9 +560,10 @@ impl Modal for PopupPicker {
                 .map(|m| m.selection != selection)
                 .unwrap_or(true);
             if rebuild {
+                let entries = self.entries.borrow();
                 results.replace(MatchResults {
                     selection: selection.clone(),
-                    matches: compute_matches(&selection, &self.entries),
+                    matches: compute_matches(&selection, &entries),
                 });
                 // Keep selected_row in bounds after re-score.
                 let new_len = results.as_ref().map(|m| m.matches.len()).unwrap_or(0);
