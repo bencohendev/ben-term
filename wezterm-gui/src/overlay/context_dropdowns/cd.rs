@@ -106,6 +106,13 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
         cursor.x,
         cursor_viewport_row,
     )));
+    // The Space that triggered us was consumed by the KeyAssignment. Echo it
+    // back into the shell so the command line reads `cd ` and subsequent
+    // filter chars append correctly (see `PopupPicker::forward_to_pane`).
+    let _ = pane.key_down(
+        wezterm_term::KeyCode::Char(' '),
+        wezterm_term::KeyModifiers::NONE,
+    );
     TriggerResult::Launched
 }
 

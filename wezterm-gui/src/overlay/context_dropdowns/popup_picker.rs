@@ -57,9 +57,10 @@ pub struct PopupPicker {
     /// only fires at a live prompt where the cursor is on-screen.
     cursor_viewport_row: isize,
     // Interior mutability: `Modal` methods take `&self`.
+    /// Filter text. Append-only — no in-filter cursor. The "real" cursor
+    /// stays in the shell behind the popup; users edit via Backspace
+    /// (removes last char) or Ctrl-U (clears).
     selection: RefCell<String>,
-    /// Byte offset into `selection` where the next insert/delete happens.
-    filter_cursor: RefCell<usize>,
     selected_row: RefCell<usize>,
     top_row: RefCell<usize>,
     matches: RefCell<Option<MatchResults>>,
@@ -80,7 +81,6 @@ impl PopupPicker {
             cursor_col,
             cursor_viewport_row,
             selection: RefCell::new(String::new()),
-            filter_cursor: RefCell::new(0),
             selected_row: RefCell::new(0),
             top_row: RefCell::new(0),
             matches: RefCell::new(None),
@@ -120,61 +120,39 @@ impl PopupPicker {
         }
     }
 
-    fn filter_insert(&self, c: char) {
-        let mut selection = self.selection.borrow_mut();
-        let mut cursor = self.filter_cursor.borrow_mut();
-        selection.insert(*cursor, c);
-        *cursor += c.len_utf8();
+    fn filter_append(&self, c: char) {
+        self.selection.borrow_mut().push(c);
     }
 
-    fn filter_backspace(&self) {
-        let mut selection = self.selection.borrow_mut();
-        let mut cursor = self.filter_cursor.borrow_mut();
-        if *cursor == 0 {
-            return;
-        }
-        let prev = prev_char_boundary(&selection, *cursor);
-        selection.drain(prev..*cursor);
-        *cursor = prev;
-    }
-
-    fn filter_delete(&self) {
-        let mut selection = self.selection.borrow_mut();
-        let cursor = *self.filter_cursor.borrow();
-        if cursor >= selection.len() {
-            return;
-        }
-        let next = next_char_boundary(&selection, cursor);
-        selection.drain(cursor..next);
-    }
-
-    fn filter_left(&self) {
-        let selection = self.selection.borrow();
-        let mut cursor = self.filter_cursor.borrow_mut();
-        if *cursor > 0 {
-            *cursor = prev_char_boundary(&selection, *cursor);
-        }
-    }
-
-    fn filter_right(&self) {
-        let selection = self.selection.borrow();
-        let mut cursor = self.filter_cursor.borrow_mut();
-        if *cursor < selection.len() {
-            *cursor = next_char_boundary(&selection, *cursor);
-        }
-    }
-
-    fn filter_home(&self) {
-        *self.filter_cursor.borrow_mut() = 0;
-    }
-
-    fn filter_end(&self) {
-        *self.filter_cursor.borrow_mut() = self.selection.borrow().len();
+    /// Pop the last character off the filter. Uses char boundaries so
+    /// multi-byte characters (e.g. `é` = 2 bytes) come off in one step.
+    fn filter_pop(&self) {
+        self.selection.borrow_mut().pop();
     }
 
     fn filter_clear(&self) {
         self.selection.borrow_mut().clear();
-        *self.filter_cursor.borrow_mut() = 0;
+    }
+
+    /// Forward a single key to the source pane's PTY. Used to echo filter
+    /// typing into the shell so the command line stays in sync with the
+    /// popup's internal filter state.
+    fn forward_to_pane(&self, key: KeyCode, mods: KeyModifiers) {
+        if let Some(pane) = mux::Mux::get().get_pane(self.source_pane_id) {
+            let _ = pane.key_down(key, mods);
+        }
+    }
+
+    /// Send `n` Backspace keys to the source pane's PTY. Used when the user
+    /// clears the filter (Ctrl-U) or selects an entry (Enter) — both need to
+    /// rub out the filter chars already echoed into the shell before any
+    /// replacement text is pasted.
+    fn send_backspaces(&self, n: usize) {
+        if let Some(pane) = mux::Mux::get().get_pane(self.source_pane_id) {
+            for _ in 0..n {
+                let _ = pane.key_down(KeyCode::Backspace, KeyModifiers::NONE);
+            }
+        }
     }
 
     /// Returns the absolute path to paste on Enter, or None if there's no
@@ -193,9 +171,6 @@ impl PopupPicker {
         matches: &MatchResults,
         max_rows_on_screen: usize,
     ) -> anyhow::Result<Vec<ComputedElement>> {
-        let selection_ref = self.selection.borrow();
-        let selection = selection_ref.as_str();
-        let filter_cursor = *self.filter_cursor.borrow();
         let entries = self.entries.as_slice();
         let selected_row = *self.selected_row.borrow();
         let top_row = *self.top_row.borrow();
@@ -225,20 +200,10 @@ impl PopupPicker {
             .to_linear()
             .into();
 
-        // Header row: `> <filter text with an underscore caret>`. Rendering
-        // the caret inline avoids the need for a separate cursor primitive.
-        let (before_caret, after_caret) = selection.split_at(filter_cursor.min(selection.len()));
-        let header_text = format!("> {before_caret}_{after_caret}");
-        let mut rows =
-            vec![
-                Element::new(&font, ElementContent::Text(header_text))
-                    .colors(ElementColors {
-                        border: BorderColor::default(),
-                        bg: LinearRgba::TRANSPARENT.into(),
-                        text: solid_fg_color.clone(),
-                    })
-                    .display(DisplayType::Block),
-            ];
+        // No header row: the filter text is echoed into the shell itself
+        // (see `forward_to_pane` in `key_down`), so the user reads it from
+        // the prompt. The popup shows filtered candidates only.
+        let mut rows: Vec<Element> = Vec::new();
 
         if matches.matches.is_empty() {
             rows.push(
@@ -377,22 +342,6 @@ impl PopupPicker {
     }
 }
 
-fn prev_char_boundary(s: &str, pos: usize) -> usize {
-    s[..pos]
-        .char_indices()
-        .next_back()
-        .map(|(i, _)| i)
-        .unwrap_or(0)
-}
-
-fn next_char_boundary(s: &str, pos: usize) -> usize {
-    s[pos..]
-        .chars()
-        .next()
-        .map(|c| pos + c.len_utf8())
-        .unwrap_or(pos)
-}
-
 fn compute_matches(selection: &str, entries: &[PickerEntry]) -> Vec<usize> {
     if selection.is_empty() {
         (0..entries.len()).collect()
@@ -448,44 +397,48 @@ impl Modal for PopupPicker {
                     self.move_down();
                 }
             }
-            (KeyCode::LeftArrow, KeyModifiers::NONE)
-            | (KeyCode::Char('b'), KeyModifiers::CTRL) => {
-                self.filter_left();
-            }
-            (KeyCode::RightArrow, KeyModifiers::NONE)
-            | (KeyCode::Char('f'), KeyModifiers::CTRL) => {
-                self.filter_right();
-            }
-            (KeyCode::Home, KeyModifiers::NONE) | (KeyCode::Char('a'), KeyModifiers::CTRL) => {
-                self.filter_home();
-            }
-            (KeyCode::End, KeyModifiers::NONE) | (KeyCode::Char('e'), KeyModifiers::CTRL) => {
-                self.filter_end();
-            }
-            (KeyCode::Backspace, KeyModifiers::NONE) => {
-                self.filter_backspace();
-                self.updated_input();
-            }
-            (KeyCode::Delete, KeyModifiers::NONE) => {
-                self.filter_delete();
-                self.updated_input();
+            (KeyCode::Backspace, KeyModifiers::NONE) | (KeyCode::Delete, KeyModifiers::NONE) => {
+                // Always forward to the shell so the echoed character gets
+                // rubbed out of the command line. If the filter was already
+                // empty, close the popup — the user is backing out past the
+                // trigger (e.g. erasing the space after `cd`).
+                let was_empty = self.selection.borrow().is_empty();
+                if !was_empty {
+                    self.filter_pop();
+                    self.updated_input();
+                }
+                if was_empty {
+                    term_window.cancel_modal();
+                }
+                self.forward_to_pane(key, mods);
+                if was_empty {
+                    return Ok(true);
+                }
             }
             (KeyCode::Char('u'), KeyModifiers::CTRL) => {
+                // Rub out every echoed filter char from the shell, then clear
+                // the popup's filter state.
+                let n = self.selection.borrow().chars().count();
+                self.send_backspaces(n);
                 self.filter_clear();
                 self.updated_input();
             }
             (KeyCode::Char(c), KeyModifiers::NONE) | (KeyCode::Char(c), KeyModifiers::SHIFT) => {
-                self.filter_insert(c);
+                self.filter_append(c);
                 self.updated_input();
+                // Echo the typed char into the shell so the command line
+                // stays in sync with the filter text.
+                self.forward_to_pane(key, mods);
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 if let Some(value) = self.selected_value() {
-                    let mux = mux::Mux::get();
-                    if let Some(pane) = mux.get_pane(self.source_pane_id) {
-                        // User already typed `cd` before Space — only append
-                        // the argument. Leading space + shell-quoted path.
-                        let insertion = format!(" {}", super::shell_quote(&value));
-                        let _ = pane.send_paste(&insertion);
+                    // Erase any filter text we echoed into the shell, then
+                    // paste the chosen value. The trigger Space was already
+                    // re-sent at activation time, so no leading space here.
+                    let n = self.selection.borrow().chars().count();
+                    self.send_backspaces(n);
+                    if let Some(pane) = mux::Mux::get().get_pane(self.source_pane_id) {
+                        let _ = pane.send_paste(&super::shell_quote(&value));
                     }
                 }
                 term_window.cancel_modal();
@@ -561,77 +514,47 @@ mod tests {
     fn mk_picker(filter: &str) -> PopupPicker {
         let picker = PopupPicker::new(vec![], 0, 0, 0);
         *picker.selection.borrow_mut() = filter.to_string();
-        *picker.filter_cursor.borrow_mut() = filter.len();
         picker
     }
 
     #[test]
-    fn insert_at_cursor_inserts_midway() {
+    fn append_adds_to_end() {
         let p = mk_picker("foo");
-        *p.filter_cursor.borrow_mut() = 1;
-        p.filter_insert('X');
-        assert_eq!(*p.selection.borrow(), "fXoo");
-        assert_eq!(*p.filter_cursor.borrow(), 2);
+        p.filter_append('X');
+        assert_eq!(*p.selection.borrow(), "fooX");
     }
 
     #[test]
-    fn left_right_respect_bounds() {
-        let p = mk_picker("ab");
-        assert_eq!(*p.filter_cursor.borrow(), 2);
-        p.filter_right();
-        assert_eq!(*p.filter_cursor.borrow(), 2, "right at end is a no-op");
-        p.filter_left();
-        p.filter_left();
-        p.filter_left();
-        assert_eq!(*p.filter_cursor.borrow(), 0, "left at start saturates to 0");
-    }
-
-    #[test]
-    fn backspace_removes_before_cursor() {
+    fn backspace_pops_last_char() {
         let p = mk_picker("hello");
-        *p.filter_cursor.borrow_mut() = 3;
-        p.filter_backspace();
-        assert_eq!(*p.selection.borrow(), "helo");
-        assert_eq!(*p.filter_cursor.borrow(), 2);
+        p.filter_pop();
+        assert_eq!(*p.selection.borrow(), "hell");
+        p.filter_pop();
+        assert_eq!(*p.selection.borrow(), "hel");
     }
 
     #[test]
-    fn delete_removes_at_cursor() {
-        let p = mk_picker("hello");
-        *p.filter_cursor.borrow_mut() = 2;
-        p.filter_delete();
-        assert_eq!(*p.selection.borrow(), "helo");
-        assert_eq!(*p.filter_cursor.borrow(), 2, "delete leaves cursor in place");
+    fn pop_on_empty_is_noop() {
+        let p = mk_picker("");
+        p.filter_pop();
+        assert_eq!(*p.selection.borrow(), "");
     }
 
     #[test]
-    fn home_end_jump_to_boundaries() {
-        let p = mk_picker("abcdef");
-        p.filter_home();
-        assert_eq!(*p.filter_cursor.borrow(), 0);
-        p.filter_end();
-        assert_eq!(*p.filter_cursor.borrow(), 6);
-    }
-
-    #[test]
-    fn ctrl_u_clears_and_resets_cursor() {
+    fn ctrl_u_clears_filter() {
         let p = mk_picker("abcdef");
         p.filter_clear();
         assert_eq!(*p.selection.borrow(), "");
-        assert_eq!(*p.filter_cursor.borrow(), 0);
     }
 
-    /// Multi-byte chars: `é` is 2 bytes. Cursor moves must land on char
-    /// boundaries or filter.insert / drain panics at runtime.
+    /// Multi-byte chars: `é` is 2 bytes. `String::pop` is char-aware so a
+    /// single backspace removes the whole `é`, not a stray byte.
     #[test]
-    fn handles_multibyte_chars() {
+    fn pop_handles_multibyte_chars() {
         let p = mk_picker("café");
         assert_eq!(p.selection.borrow().len(), 5);
-        p.filter_left();
-        assert_eq!(*p.filter_cursor.borrow(), 3);
-        p.filter_backspace();
-        assert_eq!(*p.selection.borrow(), "caé");
-        assert_eq!(*p.filter_cursor.borrow(), 2);
+        p.filter_pop();
+        assert_eq!(*p.selection.borrow(), "caf");
     }
 
     #[test]

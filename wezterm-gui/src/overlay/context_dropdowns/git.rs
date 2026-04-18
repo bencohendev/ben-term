@@ -100,6 +100,13 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
         cursor.x,
         cursor_viewport_row,
     )));
+    // Trigger Space was consumed by the KeyAssignment. Echo it back so the
+    // command line reads `git <sub> ` and subsequent filter chars append
+    // cleanly (see `PopupPicker::forward_to_pane`).
+    let _ = pane.key_down(
+        wezterm_term::KeyCode::Char(' '),
+        wezterm_term::KeyModifiers::NONE,
+    );
     TriggerResult::Launched
 }
 
