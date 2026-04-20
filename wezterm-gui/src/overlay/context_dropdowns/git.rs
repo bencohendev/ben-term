@@ -5,14 +5,14 @@
 //! `PopupPicker` popup; per-category gather logic lives in this file.
 //!
 //! Categories:
-//!   - `Refs`    — `checkout` / `switch` / `merge` / `rebase` / `cherry-pick`
-//!                 → local branches + tags via `for-each-ref`
-//!   - `Stash`   — `stash pop` / `stash apply` / `stash drop` / `stash show`
-//!                 → entries from `stash list`
-//!   - `Files`   — `add` / `rm` / `reset` / `restore`
-//!                 → changed / untracked paths from `status --porcelain -z`
-//!   - `Remotes` — `push` / `pull` / `fetch`
-//!                 → configured remote names from `git remote`
+//! - `Refs` — `checkout` / `switch` / `merge` / `rebase` / `cherry-pick`;
+//!   candidates are local branches + tags from `for-each-ref`.
+//! - `Stash` — `stash pop` / `stash apply` / `stash drop` / `stash show`;
+//!   candidates from `stash list` (value is the `stash@{N}` prefix).
+//! - `Files` — `add` / `rm` / `reset` / `restore`; candidates are changed
+//!   / untracked paths from `status --porcelain -z`.
+//! - `Remotes` — `push` / `pull` / `fetch`; candidates are configured
+//!   remote names from `git remote`.
 //!
 //! Dispatch: the key assignment `ActivateContextDropdown(Cd)` fans out through
 //! `cd::try_activate` → `git::try_activate`. The `Cd` variant name is
