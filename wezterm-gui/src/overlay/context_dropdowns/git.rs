@@ -5,14 +5,19 @@
 //! `PopupPicker` popup; per-category gather logic lives in this file.
 //!
 //! Categories:
-//! - `Refs` — `checkout` / `switch` / `merge` / `rebase` / `cherry-pick`;
-//!   candidates are local branches + tags from `for-each-ref`.
+//! - `Refs` — `checkout` / `switch` / `merge` / `rebase`; candidates are
+//!   local branches + tags from `for-each-ref`.
 //! - `Stash` — `stash pop` / `stash apply` / `stash drop` / `stash show`;
 //!   candidates from `stash list` (value is the `stash@{N}` prefix).
-//! - `Files` — `add` / `rm` / `reset` / `restore`; candidates are changed
-//!   / untracked paths from `status --porcelain -z`.
+//! - `Files` — `add` / `rm` / `restore`; candidates are changed / untracked
+//!   paths from `status --porcelain -z`.
 //! - `Remotes` — `push` / `pull` / `fetch`; candidates are configured
 //!   remote names from `git remote`.
+//! - `Commits` — `cherry-pick` / `reset` / `show`; candidates are recent
+//!   commits from `git log --oneline -50` (value is the short sha). Note
+//!   that `git stash show` still routes to the Stash category via the
+//!   3-token detection branch — only the bare 2-token `git show` lands
+//!   here.
 //!
 //! Dispatch: the key assignment `ActivateContextDropdown(Cd)` fans out through
 //! `cd::try_activate` → `git::try_activate`. The `Cd` variant name is
@@ -39,18 +44,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Git subcommands whose next argument is a ref (branch or tag).
-const REF_SUBCOMMANDS: &[&str] = &["checkout", "switch", "merge", "rebase", "cherry-pick"];
+const REF_SUBCOMMANDS: &[&str] = &["checkout", "switch", "merge", "rebase"];
 
 /// `git stash <action>` variants that take a stash ref as their next arg.
 const STASH_ACTIONS: &[&str] = &["pop", "apply", "drop", "show"];
 
 /// Git subcommands whose next argument is a file path (a pathspec).
-///
-/// `reset` is included even though `git reset` without args is legitimate
-/// (resets the index) — pressing Space after `git reset` is a reasonable
-/// "I'm about to type a path" signal, and if the user wanted the bare form
-/// they'd press Enter, not Space.
-const FILE_SUBCOMMANDS: &[&str] = &["add", "rm", "reset", "restore"];
+const FILE_SUBCOMMANDS: &[&str] = &["add", "rm", "restore"];
 
 /// Git subcommands whose next argument is a remote name.
 ///
@@ -59,6 +59,19 @@ const FILE_SUBCOMMANDS: &[&str] = &["add", "rm", "reset", "restore"];
 /// bare subcommand offers the configured remotes; Escape falls back to
 /// typing options like `-u` manually.
 const REMOTE_SUBCOMMANDS: &[&str] = &["push", "pull", "fetch"];
+
+/// Git subcommands whose next argument is a commit-ish (typically a sha).
+///
+/// `cherry-pick` and `reset` are here even though both accept refs too — for
+/// `cherry-pick` the common case is picking a specific sha; for `reset` the
+/// common non-bare case is moving HEAD to a past commit (`git reset <sha>`).
+/// A user who wants to reset paths instead can Escape the popup and type
+/// the path; a user who wants to cherry-pick a branch tip still has the
+/// branch name visible in the recent log entries.
+///
+/// `show` only lands here in its 2-token form — `git stash show` is caught
+/// earlier by the Stash branch of `detect_git_picker_strict`.
+const COMMIT_SUBCOMMANDS: &[&str] = &["cherry-pick", "reset", "show"];
 
 const GIT_SHELL_BUDGET: Duration = Duration::from_millis(250);
 
@@ -71,6 +84,7 @@ enum GitPickerKind {
     Stash,
     Files,
     Remotes,
+    Commits,
 }
 
 impl GitPickerKind {
@@ -80,6 +94,7 @@ impl GitPickerKind {
             Self::Stash => gather_stash(cwd),
             Self::Files => gather_files(cwd),
             Self::Remotes => gather_remotes(cwd),
+            Self::Commits => gather_commits(cwd),
         }
     }
 }
@@ -201,6 +216,9 @@ fn classify_two_token(sub: &str) -> Option<GitPickerKind> {
     }
     if REMOTE_SUBCOMMANDS.contains(&sub) {
         return Some(GitPickerKind::Remotes);
+    }
+    if COMMIT_SUBCOMMANDS.contains(&sub) {
+        return Some(GitPickerKind::Commits);
     }
     None
 }
@@ -340,6 +358,33 @@ fn gather_files(cwd: &Path) -> Vec<PickerEntry> {
         return Vec::new();
     };
     parse_porcelain(stdout.as_bytes())
+}
+
+/// Recent commits from `git log --oneline -50`. Each line is `<short-sha>
+/// <subject>` — label is the full line so the user sees the subject; value
+/// is the short sha, which is what `cherry-pick` / `reset` / `show` expect
+/// as their next positional arg.
+fn gather_commits(cwd: &Path) -> Vec<PickerEntry> {
+    let Some(stdout) = run_git(cwd, &["log", "--oneline", "-50"]) else {
+        return Vec::new();
+    };
+    parse_log(&stdout)
+}
+
+/// Parse `git log --oneline` output into picker entries. Extracted as a
+/// pure function so we can unit-test the parser without shelling out.
+fn parse_log(stdout: &str) -> Vec<PickerEntry> {
+    stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| {
+            let sha = l.split_whitespace().next()?;
+            Some(PickerEntry {
+                label: l.to_string(),
+                value: sha.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Parse `git status --porcelain=v1 -z` output into picker entries.
@@ -628,5 +673,92 @@ mod tests {
     fn strict_rejects_remote_with_arg_present() {
         assert_eq!(detect_git_picker_strict("git push origin"), None);
         assert_eq!(detect_git_picker_strict("git pull upstream main"), None);
+    }
+
+    #[test]
+    fn strict_accepts_each_commit_subcommand() {
+        for sub in COMMIT_SUBCOMMANDS {
+            let line = format!("git {sub}");
+            assert_eq!(
+                detect_git_picker_strict(&line),
+                Some(GitPickerKind::Commits),
+                "strict should accept `{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn heuristic_accepts_each_commit_subcommand() {
+        for sub in COMMIT_SUBCOMMANDS {
+            let line = format!("~ $ git {sub}");
+            assert_eq!(
+                detect_git_picker_heuristic(&line),
+                Some(GitPickerKind::Commits),
+                "heuristic should accept `{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_rejects_commit_with_arg_present() {
+        assert_eq!(detect_git_picker_strict("git cherry-pick abc1234"), None);
+        assert_eq!(detect_git_picker_strict("git reset HEAD~1"), None);
+        assert_eq!(detect_git_picker_strict("git show v1.0"), None);
+    }
+
+    /// `git stash show` must still route to the Stash kind even though `show`
+    /// is now a Commits subcommand — the 3-token stash branch runs first.
+    #[test]
+    fn strict_git_stash_show_still_routes_to_stash() {
+        assert_eq!(
+            detect_git_picker_strict("git stash show"),
+            Some(GitPickerKind::Stash)
+        );
+        assert_eq!(
+            detect_git_picker_heuristic("~ $ git stash show"),
+            Some(GitPickerKind::Stash)
+        );
+    }
+
+    /// `cherry-pick` moved from Refs → Commits; `reset` moved from Files →
+    /// Commits. Regression-guard the new routing.
+    #[test]
+    fn strict_moved_subcommands_route_to_commits() {
+        assert_eq!(
+            detect_git_picker_strict("git cherry-pick"),
+            Some(GitPickerKind::Commits)
+        );
+        assert_eq!(
+            detect_git_picker_strict("git reset"),
+            Some(GitPickerKind::Commits)
+        );
+    }
+
+    #[test]
+    fn parse_log_simple() {
+        let input = "abc1234 fix the bug\ndef5678 add feature\n";
+        let entries = parse_log(input);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].label, "abc1234 fix the bug");
+        assert_eq!(entries[0].value, "abc1234");
+        assert_eq!(entries[1].label, "def5678 add feature");
+        assert_eq!(entries[1].value, "def5678");
+    }
+
+    /// Subjects routinely contain spaces — the label keeps the whole line,
+    /// the value is only the first token (the sha).
+    #[test]
+    fn parse_log_subject_with_spaces() {
+        let input = "abc1234 subject with many spaces and words\n";
+        let entries = parse_log(input);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value, "abc1234");
+        assert_eq!(entries[0].label, "abc1234 subject with many spaces and words");
+    }
+
+    #[test]
+    fn parse_log_empty_input() {
+        assert!(parse_log("").is_empty());
+        assert!(parse_log("\n\n").is_empty());
     }
 }
