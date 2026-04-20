@@ -35,13 +35,14 @@ use crate::overlay::context_dropdowns::popup_picker::{PickerEntry, PopupPicker};
 use crate::overlay::context_dropdowns::{
     split_input_zone_at_cursor, split_logical_line_at_cursor, TriggerResult,
 };
-use crate::termwindow::TermWindow;
+use crate::termwindow::{TermWindow, TermWindowNotif};
 use mux::pane::Pane;
 use std::path::Path;
 use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
+use window::WindowOps;
 
 /// Git subcommands whose next argument is a ref (branch or tag).
 const REF_SUBCOMMANDS: &[&str] = &["checkout", "switch", "merge", "rebase"];
@@ -144,10 +145,12 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
         return TriggerResult::PassThrough;
     };
 
-    // Empty output here means "not a git repo", "empty repo", or "no stashes".
-    // Either way, there's nothing to pick, so bail without a popup.
-    let entries = kind.gather(&cwd);
-    if entries.is_empty() {
+    // Fast repo pre-check: pure stat syscalls walking up for `.git`. Avoids
+    // flashing a popup that would immediately fail the shell-out for the
+    // common "not in a git repo" case. Per-command empty results (e.g.
+    // `git stash pop` in a repo with no stashes) are handled in the loader
+    // callback below, which cancels the modal if the gather returns empty.
+    if !is_git_repo(&cwd) {
         return TriggerResult::PassThrough;
     }
 
@@ -155,13 +158,15 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
     let cursor = pane.get_cursor_position();
     let dims = pane.get_dimensions();
     let cursor_viewport_row = cursor.y - dims.physical_top;
+    let pane_id = pane.pane_id();
 
-    term_window.set_modal(Rc::new(PopupPicker::new(
-        entries,
-        pane.pane_id(),
-        cursor.x,
-        cursor_viewport_row,
-    )));
+    // Open the popup instantly in a loading state — the git shell-out can
+    // take up to GIT_SHELL_BUDGET (250 ms) and users perceive that as lag.
+    // Gathering runs on a worker thread and results are swapped in via
+    // `TermWindowNotif::Apply` when ready.
+    let picker = PopupPicker::new_loading(pane_id, cursor.x, cursor_viewport_row);
+    let picker_id = picker.id();
+    term_window.set_modal(Rc::new(picker));
     // Trigger Space was consumed by the KeyAssignment. Echo it back so the
     // command line reads `git <sub> ` and subsequent filter chars append
     // cleanly (see `PopupPicker::forward_to_pane`).
@@ -169,7 +174,65 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
         wezterm_term::KeyCode::Char(' '),
         wezterm_term::KeyModifiers::NONE,
     );
+
+    // Background gather. `PopupPicker` is `!Send` (lives in `Rc`), so we
+    // post back to the main thread via `TermWindowNotif::Apply` and locate
+    // the picker there via `downcast_ref`.
+    let window = term_window.window.clone();
+    promise::spawn::spawn_into_new_thread(move || -> anyhow::Result<()> {
+        let entries = kind.gather(&cwd);
+        if let Some(window) = window {
+            window.notify(TermWindowNotif::Apply(Box::new(
+                move |tw: &mut TermWindow| {
+                    let Some(modal) = tw.get_modal() else {
+                        return;
+                    };
+                    let Some(picker) = modal.downcast_ref::<PopupPicker>() else {
+                        return;
+                    };
+                    // Guard against a stale result landing in a newer picker.
+                    if picker.id() != picker_id {
+                        return;
+                    }
+                    // Empty result in a repo means "this command has no
+                    // candidates right now" (empty repo, no stashes, no
+                    // remotes, clean worktree, etc.). Dismiss instead of
+                    // leaving "(no matches)" stuck on screen — matches the
+                    // prior sync behavior of bailing before showing the
+                    // popup at all.
+                    if entries.is_empty() {
+                        tw.cancel_modal();
+                    } else {
+                        picker.set_entries_loaded(entries);
+                        tw.invalidate_modal();
+                    }
+                },
+            )));
+        }
+        Ok(())
+    })
+    .detach();
+
     TriggerResult::Launched
+}
+
+/// Fast synchronous check for "is `cwd` inside a git worktree?". Walks up
+/// the parent chain looking for a `.git` entry (directory in a normal repo,
+/// file in a linked worktree — both count). Pure stat syscalls, typically
+/// sub-millisecond even on a cold FS cache.
+///
+/// Used as a pre-flight gate before opening the git picker's loading popup:
+/// without it, every `git checkout <space>` outside a repo would briefly
+/// flash a popup that then cancels itself when the shell-out returns empty.
+fn is_git_repo(cwd: &Path) -> bool {
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        if d.join(".git").exists() {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
 }
 
 /// Strict trigger: `left` is the OSC 133 Input zone up to the cursor.
@@ -760,5 +823,40 @@ mod tests {
     fn parse_log_empty_input() {
         assert!(parse_log("").is_empty());
         assert!(parse_log("\n\n").is_empty());
+    }
+
+    /// A plain directory with no ancestors containing `.git` is not a repo.
+    #[test]
+    fn is_git_repo_rejects_non_repo_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!is_git_repo(tmp.path()));
+    }
+
+    /// A directory containing `.git` (as a dir — the normal repo shape) is
+    /// recognized without needing to actually initialize a repo.
+    #[test]
+    fn is_git_repo_accepts_dir_with_dotgit() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        assert!(is_git_repo(tmp.path()));
+    }
+
+    /// Linked worktrees (`git worktree add`) have a `.git` FILE pointing at
+    /// the parent's gitdir, not a directory. Must still count as a repo.
+    #[test]
+    fn is_git_repo_accepts_dotgit_as_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert!(is_git_repo(tmp.path()));
+    }
+
+    /// The walk-up behavior: being N levels below a repo root still counts.
+    #[test]
+    fn is_git_repo_finds_ancestor_dotgit() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let deep = tmp.path().join("a/b/c");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert!(is_git_repo(&deep));
     }
 }

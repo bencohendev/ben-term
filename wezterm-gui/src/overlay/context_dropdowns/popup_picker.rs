@@ -88,21 +88,6 @@ pub struct PopupPicker {
 }
 
 impl PopupPicker {
-    pub fn new(
-        entries: Vec<PickerEntry>,
-        source_pane_id: PaneId,
-        cursor_col: usize,
-        cursor_viewport_row: isize,
-    ) -> Self {
-        Self::with_state(
-            entries,
-            false,
-            source_pane_id,
-            cursor_col,
-            cursor_viewport_row,
-        )
-    }
-
     /// Construct in a "loading" state with no entries yet. The caller is
     /// expected to call `set_entries_loaded` on the main thread once the
     /// candidates finish gathering (typically via a `TermWindowNotif::Apply`
@@ -113,26 +98,10 @@ impl PopupPicker {
         cursor_col: usize,
         cursor_viewport_row: isize,
     ) -> Self {
-        Self::with_state(
-            Vec::new(),
-            true,
-            source_pane_id,
-            cursor_col,
-            cursor_viewport_row,
-        )
-    }
-
-    fn with_state(
-        entries: Vec<PickerEntry>,
-        loading: bool,
-        source_pane_id: PaneId,
-        cursor_col: usize,
-        cursor_viewport_row: isize,
-    ) -> Self {
         Self {
             id: NEXT_PICKER_ID.fetch_add(1, Ordering::Relaxed),
-            entries: RefCell::new(entries),
-            loading: RefCell::new(loading),
+            entries: RefCell::new(Vec::new()),
+            loading: RefCell::new(true),
             source_pane_id,
             cursor_col,
             cursor_viewport_row,
@@ -657,7 +626,7 @@ mod tests {
     use super::*;
 
     fn mk_picker(filter: &str) -> PopupPicker {
-        let picker = PopupPicker::new(vec![], 0, 0, 0);
+        let picker = PopupPicker::new_loading(0, 0, 0);
         *picker.selection.borrow_mut() = filter.to_string();
         picker
     }
@@ -718,9 +687,11 @@ mod tests {
                 value: "/c".into(),
             },
         ];
-        let picker = PopupPicker::new(entries, 0, 0, 0);
+        let picker = PopupPicker::new_loading(0, 0, 0);
+        picker.set_entries_loaded(entries);
         // Seed an all-pass match list (what `compute_matches("", …)` returns
-        // for an empty filter).
+        // for an empty filter). `set_entries_loaded` clears any cached
+        // matches, so we assign afterwards.
         *picker.matches.borrow_mut() = Some(MatchResults {
             selection: String::new(),
             matches: vec![0, 1, 2],
@@ -737,7 +708,7 @@ mod tests {
 
     #[test]
     fn selected_value_is_none_when_no_matches() {
-        let picker = PopupPicker::new(vec![], 0, 0, 0);
+        let picker = PopupPicker::new_loading(0, 0, 0);
         *picker.matches.borrow_mut() = Some(MatchResults {
             selection: String::new(),
             matches: vec![],
