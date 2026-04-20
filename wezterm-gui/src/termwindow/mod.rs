@@ -1869,7 +1869,10 @@ impl TermWindow {
         }
     }
 
-    fn get_modal(&self) -> Option<Rc<dyn Modal>> {
+    // NOTE: `pub` so async background loaders (ben-term context dropdowns)
+    // can locate the currently-installed modal on the main thread and
+    // downcast to the concrete picker type to push in deferred results.
+    pub fn get_modal(&self) -> Option<Rc<dyn Modal>> {
         self.modal.borrow().as_ref().map(|m| Rc::clone(&m))
     }
 
