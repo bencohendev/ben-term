@@ -9,6 +9,8 @@
 //!                 → local branches + tags via `for-each-ref`
 //!   - `Stash`   — `stash pop` / `stash apply` / `stash drop` / `stash show`
 //!                 → entries from `stash list`
+//!   - `Files`   — `add` / `rm` / `reset` / `restore`
+//!                 → changed / untracked paths from `status --porcelain -z`
 //!
 //! Dispatch: the key assignment `ActivateContextDropdown(Cd)` fans out through
 //! `cd::try_activate` → `git::try_activate`. The `Cd` variant name is
@@ -40,6 +42,14 @@ const REF_SUBCOMMANDS: &[&str] = &["checkout", "switch", "merge", "rebase", "che
 /// `git stash <action>` variants that take a stash ref as their next arg.
 const STASH_ACTIONS: &[&str] = &["pop", "apply", "drop", "show"];
 
+/// Git subcommands whose next argument is a file path (a pathspec).
+///
+/// `reset` is included even though `git reset` without args is legitimate
+/// (resets the index) — pressing Space after `git reset` is a reasonable
+/// "I'm about to type a path" signal, and if the user wanted the bare form
+/// they'd press Enter, not Space.
+const FILE_SUBCOMMANDS: &[&str] = &["add", "rm", "reset", "restore"];
+
 const GIT_SHELL_BUDGET: Duration = Duration::from_millis(250);
 
 /// Which flavor of git picker to open. Trigger detection returns this so
@@ -49,6 +59,7 @@ const GIT_SHELL_BUDGET: Duration = Duration::from_millis(250);
 enum GitPickerKind {
     Refs,
     Stash,
+    Files,
 }
 
 impl GitPickerKind {
@@ -56,6 +67,7 @@ impl GitPickerKind {
         match self {
             Self::Refs => gather_refs(cwd),
             Self::Stash => gather_stash(cwd),
+            Self::Files => gather_files(cwd),
         }
     }
 }
@@ -137,6 +149,8 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
 ///
 /// Accepts:
 ///   - `git <sub>` with no third token, where `<sub>` ∈ REF_SUBCOMMANDS → Refs
+///   - `git <sub>` with no third token, where `<sub>` ∈ FILE_SUBCOMMANDS
+///     → Files
 ///   - `git stash <action>` with no fourth token, where `<action>` ∈
 ///     STASH_ACTIONS → Stash
 ///
@@ -158,9 +172,20 @@ fn detect_git_picker_strict(left: &str) -> Option<GitPickerKind> {
     if toks.next().is_some() {
         return None;
     }
-    REF_SUBCOMMANDS
-        .contains(&sub)
-        .then_some(GitPickerKind::Refs)
+    classify_two_token(sub)
+}
+
+/// Map a bare subcommand string (e.g. `"checkout"`, `"add"`) to its picker
+/// kind. Shared by the strict and heuristic detectors — both funnel into
+/// the same subcommand→kind table once they've isolated the 2-token form.
+fn classify_two_token(sub: &str) -> Option<GitPickerKind> {
+    if REF_SUBCOMMANDS.contains(&sub) {
+        return Some(GitPickerKind::Refs);
+    }
+    if FILE_SUBCOMMANDS.contains(&sub) {
+        return Some(GitPickerKind::Files);
+    }
+    None
 }
 
 /// Heuristic trigger for shells without OSC 133: the line-left-of-cursor can
@@ -176,11 +201,9 @@ fn detect_git_picker_heuristic(left: &str) -> Option<GitPickerKind> {
             .contains(&toks[n - 1])
             .then_some(GitPickerKind::Stash);
     }
-    // Ref form (2 trailing tokens: `git <sub>`).
+    // 2-token form: `git <sub>` at the trailing edge.
     if n >= 2 && toks[n - 2] == "git" {
-        return REF_SUBCOMMANDS
-            .contains(&toks[n - 1])
-            .then_some(GitPickerKind::Refs);
+        return classify_two_token(toks[n - 1]);
     }
     None
 }
@@ -276,6 +299,58 @@ fn gather_stash(cwd: &Path) -> Vec<PickerEntry> {
         .collect()
 }
 
+/// Changed / untracked files from `git status --porcelain=v1 -z`. Paths are
+/// reported relative to the current directory (git's `-C` sets cwd), so
+/// pasting them straight into the shell works without any path-normalizing.
+fn gather_files(cwd: &Path) -> Vec<PickerEntry> {
+    let Some(stdout) = run_git(cwd, &["status", "--porcelain=v1", "-z"]) else {
+        return Vec::new();
+    };
+    parse_porcelain(stdout.as_bytes())
+}
+
+/// Parse `git status --porcelain=v1 -z` output into picker entries.
+///
+/// Porcelain v1 `-z` format:
+///   `XY<space>PATH\0` for normal records.
+///   `RX<space>NEW_PATH\0OLD_PATH\0` for renames (and `CX` for copies) —
+///   two NUL-separated records where the second holds the pre-rename name.
+///
+/// Extracted as a pure function so we can unit-test the parser without
+/// shelling out to a real git repo. The caller of `gather_files` owns the
+/// subprocess; this just handles bytes.
+fn parse_porcelain(bytes: &[u8]) -> Vec<PickerEntry> {
+    let records: Vec<&[u8]> = bytes
+        .split(|&b| b == 0)
+        .filter(|r| !r.is_empty())
+        .collect();
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < records.len() {
+        let record = records[i];
+        // Valid record is at minimum `XY<space>c` — 4 bytes with a 1-char
+        // path. Skip anything shorter.
+        if record.len() < 4 {
+            i += 1;
+            continue;
+        }
+        let xy = &record[..2];
+        let path = String::from_utf8_lossy(&record[3..]).into_owned();
+        let xy_str = String::from_utf8_lossy(xy).into_owned();
+        out.push(PickerEntry {
+            label: format!("{xy_str} {path}"),
+            value: path,
+        });
+        // Rename (R) / copy (C) records are followed by an extra record
+        // holding the old path. Skip it so the pre-rename name doesn't
+        // surface as a separate candidate.
+        let is_rename_or_copy = xy[0] == b'R' || xy[0] == b'C';
+        i += if is_rename_or_copy { 2 } else { 1 };
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,7 +408,7 @@ mod tests {
     fn strict_rejects_non_whitelisted_subcommand() {
         assert_eq!(detect_git_picker_strict("git status"), None);
         assert_eq!(detect_git_picker_strict("git branch"), None);
-        assert_eq!(detect_git_picker_strict("git add"), None);
+        assert_eq!(detect_git_picker_strict("git log"), None);
         assert_eq!(detect_git_picker_strict("git push"), None);
     }
 
@@ -412,5 +487,81 @@ mod tests {
         assert_eq!(detect_git_picker_heuristic(""), None);
         assert_eq!(detect_git_picker_heuristic("git"), None);
         assert_eq!(detect_git_picker_heuristic("git stash"), None);
+    }
+
+    #[test]
+    fn strict_accepts_each_file_subcommand() {
+        for sub in FILE_SUBCOMMANDS {
+            let line = format!("git {sub}");
+            assert_eq!(
+                detect_git_picker_strict(&line),
+                Some(GitPickerKind::Files),
+                "strict should accept `{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn heuristic_accepts_each_file_subcommand() {
+        for sub in FILE_SUBCOMMANDS {
+            let line = format!("~ $ git {sub}");
+            assert_eq!(
+                detect_git_picker_heuristic(&line),
+                Some(GitPickerKind::Files),
+                "heuristic should accept `{line}`"
+            );
+        }
+    }
+
+    /// Modified + untracked file — one record each, no rename handling.
+    #[test]
+    fn parse_porcelain_simple_records() {
+        let input = b" M foo.rs\0?? new.rs\0";
+        let entries = parse_porcelain(input);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].label, " M foo.rs");
+        assert_eq!(entries[0].value, "foo.rs");
+        assert_eq!(entries[1].label, "?? new.rs");
+        assert_eq!(entries[1].value, "new.rs");
+    }
+
+    /// Rename: the second NUL-separated record is the old name — it must
+    /// NOT become a separate picker entry.
+    #[test]
+    fn parse_porcelain_rename_skips_old_name() {
+        let input = b"R  new.rs\0old.rs\0 M unrelated.rs\0";
+        let entries = parse_porcelain(input);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].label, "R  new.rs");
+        assert_eq!(entries[0].value, "new.rs");
+        assert_eq!(entries[1].label, " M unrelated.rs");
+        assert_eq!(entries[1].value, "unrelated.rs");
+    }
+
+    /// Copy records (C in index status) follow the same two-record shape
+    /// as renames — the old path should be skipped too.
+    #[test]
+    fn parse_porcelain_copy_skips_source() {
+        let input = b"C  dest.rs\0src.rs\0";
+        let entries = parse_porcelain(input);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value, "dest.rs");
+    }
+
+    /// Paths can contain whitespace — porcelain -z emits them unquoted
+    /// so the whole byte range after `XY ` is the path.
+    #[test]
+    fn parse_porcelain_path_with_space() {
+        let input = b" M has space.rs\0";
+        let entries = parse_porcelain(input);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value, "has space.rs");
+    }
+
+    /// Empty stdout (clean worktree): zero entries, no crash.
+    #[test]
+    fn parse_porcelain_empty_input() {
+        assert!(parse_porcelain(b"").is_empty());
+        assert!(parse_porcelain(b"\0\0").is_empty());
     }
 }
