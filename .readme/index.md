@@ -57,6 +57,8 @@ ben-term/
 | Smart notifications | System notification when a long-running command finishes in a background tab |
 | Inline images | Polish existing iTerm2/Kitty image protocol support for matplotlib, image previews, etc. |
 | Shell integration hooks | ZLE widgets and precmd/preexec hooks for structured shell-to-terminal communication |
+| Platform keyboard parity | System-convention keybindings across the board (e.g. macOS: cmd+delete → delete to line start, option+delete → delete word, cmd+arrow word-jumps, etc.) |
+| Recent-commands popup | Up-arrow opens a popup listing the most recent shell commands for quick re-run; can ride on the context-dropdowns PopupPicker infra with a history-based gather |
 
 ## Bugs
 
