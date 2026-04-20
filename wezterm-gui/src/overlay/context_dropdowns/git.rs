@@ -34,6 +34,7 @@
 use crate::overlay::context_dropdowns::popup_picker::{PickerEntry, PopupPicker};
 use crate::overlay::context_dropdowns::{
     split_input_zone_at_cursor, split_logical_line_at_cursor, TriggerResult,
+    MIN_LOADING_VISIBLE,
 };
 use crate::termwindow::{TermWindow, TermWindowNotif};
 use mux::pane::Pane;
@@ -41,7 +42,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use window::WindowOps;
 
 /// Git subcommands whose next argument is a ref (branch or tag).
@@ -164,6 +165,7 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
     // take up to GIT_SHELL_BUDGET (250 ms) and users perceive that as lag.
     // Gathering runs on a worker thread and results are swapped in via
     // `TermWindowNotif::Apply` when ready.
+    let open_time = Instant::now();
     let picker = PopupPicker::new_loading(pane_id, cursor.x, cursor_viewport_row);
     let picker_id = picker.id();
     term_window.set_modal(Rc::new(picker));
@@ -181,6 +183,21 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
     let window = term_window.window.clone();
     promise::spawn::spawn_into_new_thread(move || -> anyhow::Result<()> {
         let entries = kind.gather(&cwd);
+        // Hold the Loading placeholder for at least one visible paint when
+        // we're about to show results. Fast categories (e.g. for-each-ref
+        // on a small repo) can complete in a few ms and beat the first
+        // vsync, otherwise swapping entries in before the Loading state
+        // ever renders — felt as lag without an indicator.
+        //
+        // Empty results bypass the delay: they'll dismiss the modal, and
+        // holding an empty popup that's about to disappear would be worse
+        // UX than letting it flash through.
+        if !entries.is_empty() {
+            let elapsed = open_time.elapsed();
+            if elapsed < MIN_LOADING_VISIBLE {
+                std::thread::sleep(MIN_LOADING_VISIBLE - elapsed);
+            }
+        }
         if let Some(window) = window {
             window.notify(TermWindowNotif::Apply(Box::new(
                 move |tw: &mut TermWindow| {
