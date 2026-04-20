@@ -1,21 +1,30 @@
 //! `git` context dropdown.
 //!
-//! Fires on `git <sub>` + Space where `<sub>` is a ref-taking subcommand
-//! (`checkout`, `switch`, `merge`, `rebase`, `cherry-pick`). Surfaces local
-//! branches + tags as candidates via `git for-each-ref`.
+//! Fires on `git <sub>` (or `git stash <action>`) + Space where `<sub>` /
+//! `<action>` matches one of the picker categories below. Reuses the shared
+//! `PopupPicker` popup; per-category gather logic lives in this file.
+//!
+//! Categories:
+//! - `Refs` — `checkout` / `switch` / `merge` / `rebase` / `cherry-pick`;
+//!   candidates are local branches + tags from `for-each-ref`.
+//! - `Stash` — `stash pop` / `stash apply` / `stash drop` / `stash show`;
+//!   candidates from `stash list` (value is the `stash@{N}` prefix).
+//! - `Files` — `add` / `rm` / `reset` / `restore`; candidates are changed
+//!   / untracked paths from `status --porcelain -z`.
+//! - `Remotes` — `push` / `pull` / `fetch`; candidates are configured
+//!   remote names from `git remote`.
 //!
 //! Dispatch: the key assignment `ActivateContextDropdown(Cd)` fans out through
 //! `cd::try_activate` → `git::try_activate`. The `Cd` variant name is
 //! historical — it's the "try each of our context pickers in order" binding.
-//! Future follow-up phases (stash, files, remotes) will chain further.
 //!
 //! Guard chain mirrors cd:
 //!   config.git_picker_enabled → not alt-screen → no existing overlay →
 //!   no existing modal → trigger text check (strict via OSC 133 Input zone,
-//!   fallback to last-two-tokens heuristic) → gather succeeds with non-empty
+//!   fallback to trailing-tokens heuristic) → gather succeeds with non-empty
 //!   result → install `PopupPicker` modal.
 //!
-//! Hard budget on the `for-each-ref` shell-out: 250 ms.
+//! Hard budget on each shell-out: 250 ms.
 
 use crate::overlay::context_dropdowns::popup_picker::{PickerEntry, PopupPicker};
 use crate::overlay::context_dropdowns::{
@@ -29,13 +38,51 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Git subcommands whose next argument is a ref (branch or tag). Ordered by
-/// rough daily-use frequency. `cherry-pick` accepts commit SHAs too, but a
-/// branch name is a valid target so we include it here; a separate commit
-/// picker is a future follow-up.
+/// Git subcommands whose next argument is a ref (branch or tag).
 const REF_SUBCOMMANDS: &[&str] = &["checkout", "switch", "merge", "rebase", "cherry-pick"];
 
+/// `git stash <action>` variants that take a stash ref as their next arg.
+const STASH_ACTIONS: &[&str] = &["pop", "apply", "drop", "show"];
+
+/// Git subcommands whose next argument is a file path (a pathspec).
+///
+/// `reset` is included even though `git reset` without args is legitimate
+/// (resets the index) — pressing Space after `git reset` is a reasonable
+/// "I'm about to type a path" signal, and if the user wanted the bare form
+/// they'd press Enter, not Space.
+const FILE_SUBCOMMANDS: &[&str] = &["add", "rm", "reset", "restore"];
+
+/// Git subcommands whose next argument is a remote name.
+///
+/// All three accept an optional remote as the first positional arg
+/// (`git push origin`, `git pull upstream`, etc.). Pressing Space after the
+/// bare subcommand offers the configured remotes; Escape falls back to
+/// typing options like `-u` manually.
+const REMOTE_SUBCOMMANDS: &[&str] = &["push", "pull", "fetch"];
+
 const GIT_SHELL_BUDGET: Duration = Duration::from_millis(250);
+
+/// Which flavor of git picker to open. Trigger detection returns this so
+/// `try_activate` can dispatch to the right gather function without repeating
+/// the guard chain per category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitPickerKind {
+    Refs,
+    Stash,
+    Files,
+    Remotes,
+}
+
+impl GitPickerKind {
+    fn gather(self, cwd: &Path) -> Vec<PickerEntry> {
+        match self {
+            Self::Refs => gather_refs(cwd),
+            Self::Stash => gather_stash(cwd),
+            Self::Files => gather_files(cwd),
+            Self::Remotes => gather_remotes(cwd),
+        }
+    }
+}
 
 /// Entry point from `perform_key_assignment` via the cd → git dispatch chain.
 /// Returns `Launched` (key consumed) or `PassThrough` (Space reaches the PTY).
@@ -56,23 +103,23 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
 
     // Prefer OSC 133 Input zone (exact command buffer, no prompt chrome).
     // Fall back to the logical-line heuristic for shells without integration.
-    let matched = match split_input_zone_at_cursor(pane) {
+    let kind = match split_input_zone_at_cursor(pane) {
         Some((left, right)) => {
             if !right.trim().is_empty() {
                 return TriggerResult::PassThrough;
             }
-            detect_git_ref_subcommand_strict(&left)
+            detect_git_picker_strict(&left)
         }
         None => {
             let Some((left, _right)) = split_logical_line_at_cursor(pane) else {
                 return TriggerResult::PassThrough;
             };
-            detect_git_ref_subcommand_heuristic(&left)
+            detect_git_picker_heuristic(&left)
         }
     };
-    if matched.is_none() {
+    let Some(kind) = kind else {
         return TriggerResult::PassThrough;
-    }
+    };
 
     let cwd = pane
         .get_current_working_dir(mux::pane::CachePolicy::AllowStale)
@@ -82,9 +129,9 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
         return TriggerResult::PassThrough;
     };
 
-    // Empty output here means "not a git repo" OR "empty repo with no refs".
+    // Empty output here means "not a git repo", "empty repo", or "no stashes".
     // Either way, there's nothing to pick, so bail without a popup.
-    let entries = gather_refs(&cwd);
+    let entries = kind.gather(&cwd);
     if entries.is_empty() {
         return TriggerResult::PassThrough;
     }
@@ -110,57 +157,87 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
     TriggerResult::Launched
 }
 
-/// Strict trigger: `left` is the OSC 133 Input zone up to the cursor. Accepts
-/// iff the first token is `git`, the second token is a ref-taking subcommand,
-/// and there is no third token (i.e. the user hasn't started typing an arg).
-fn detect_git_ref_subcommand_strict(left: &str) -> Option<&'static str> {
+/// Strict trigger: `left` is the OSC 133 Input zone up to the cursor.
+///
+/// Accepts:
+///   - `git <sub>` with no third token, where `<sub>` ∈ REF_SUBCOMMANDS → Refs
+///   - `git <sub>` with no third token, where `<sub>` ∈ FILE_SUBCOMMANDS
+///     → Files
+///   - `git <sub>` with no third token, where `<sub>` ∈ REMOTE_SUBCOMMANDS
+///     → Remotes
+///   - `git stash <action>` with no fourth token, where `<action>` ∈
+///     STASH_ACTIONS → Stash
+///
+/// Rejects anything else, including bare `git`, unknown subcommands, or any
+/// trailing argument (which means the user is mid-argument — typing a name).
+fn detect_git_picker_strict(left: &str) -> Option<GitPickerKind> {
     let mut toks = left.split_whitespace();
     if toks.next() != Some("git") {
         return None;
     }
     let sub = toks.next()?;
+    if sub == "stash" {
+        let action = toks.next()?;
+        if toks.next().is_some() {
+            return None;
+        }
+        return STASH_ACTIONS.contains(&action).then_some(GitPickerKind::Stash);
+    }
     if toks.next().is_some() {
         return None;
     }
-    REF_SUBCOMMANDS.iter().copied().find(|s| *s == sub)
+    classify_two_token(sub)
+}
+
+/// Map a bare subcommand string (e.g. `"checkout"`, `"add"`) to its picker
+/// kind. Shared by the strict and heuristic detectors — both funnel into
+/// the same subcommand→kind table once they've isolated the 2-token form.
+fn classify_two_token(sub: &str) -> Option<GitPickerKind> {
+    if REF_SUBCOMMANDS.contains(&sub) {
+        return Some(GitPickerKind::Refs);
+    }
+    if FILE_SUBCOMMANDS.contains(&sub) {
+        return Some(GitPickerKind::Files);
+    }
+    if REMOTE_SUBCOMMANDS.contains(&sub) {
+        return Some(GitPickerKind::Remotes);
+    }
+    None
 }
 
 /// Heuristic trigger for shells without OSC 133: the line-left-of-cursor can
-/// contain the shell prompt, so we match on the last two whitespace tokens.
-/// Shares the cd heuristic's false-positive class (`echo git checkout` will
-/// trigger here); users who install wezterm's shell integration get strict.
-fn detect_git_ref_subcommand_heuristic(left: &str) -> Option<&'static str> {
+/// contain the shell prompt, so we match on the trailing tokens (2 for refs,
+/// 3 for stash). Shares the cd heuristic's false-positive class —
+/// `echo git checkout` will trigger here; users with OSC 133 get strict.
+fn detect_git_picker_heuristic(left: &str) -> Option<GitPickerKind> {
     let toks: Vec<&str> = left.split_whitespace().collect();
     let n = toks.len();
-    if n < 2 {
-        return None;
+    // Stash form (3 trailing tokens: `git stash <action>`).
+    if n >= 3 && toks[n - 3] == "git" && toks[n - 2] == "stash" {
+        return STASH_ACTIONS
+            .contains(&toks[n - 1])
+            .then_some(GitPickerKind::Stash);
     }
-    if toks[n - 2] != "git" {
-        return None;
+    // 2-token form: `git <sub>` at the trailing edge.
+    if n >= 2 && toks[n - 2] == "git" {
+        return classify_two_token(toks[n - 1]);
     }
-    let sub = toks[n - 1];
-    REF_SUBCOMMANDS.iter().copied().find(|s| *s == sub)
+    None
 }
 
-/// Shells out to `git for-each-ref` in the given directory, returning one
-/// `PickerEntry` per short-named ref (`main`, `v1.2.3`, `feature/foo`, …).
-/// Returns an empty Vec on any failure (not a git repo, binary missing,
-/// budget exceeded) so the caller can fall through cleanly.
-fn gather_refs(cwd: &Path) -> Vec<PickerEntry> {
-    // GUI apps on macOS don't inherit the user's shell PATH, so mirror the
-    // cd picker's zoxide fallback. Most binaries are on one of these paths.
-    let candidates: &[&str] = &["git", "/opt/homebrew/bin/git", "/usr/local/bin/git"];
+/// Runs `git <args>` in `cwd` with a hard wall-clock cap. Returns stdout on
+/// success. None on any failure path (missing binary, non-zero exit, budget
+/// exceeded, spawn error). Mirrors the zoxide fallback from cd.rs — macOS
+/// GUI apps don't inherit the user's shell PATH, so the PATH-less candidates
+/// cover typical Homebrew installs.
+fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
+    let bins: &[&str] = &["git", "/opt/homebrew/bin/git", "/usr/local/bin/git"];
 
-    for bin in candidates {
+    for bin in bins {
         let Ok(mut child) = std::process::Command::new(bin)
             .arg("-C")
             .arg(cwd)
-            .args([
-                "for-each-ref",
-                "--format=%(refname:short)",
-                "refs/heads",
-                "refs/tags",
-            ])
+            .args(args)
             .stderr(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
@@ -172,33 +249,139 @@ fn gather_refs(cwd: &Path) -> Vec<PickerEntry> {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => {
-                    // Drain stdout.
-                    let output = child.wait_with_output().ok();
-                    if let Some(output) = output {
-                        return String::from_utf8_lossy(&output.stdout)
-                            .lines()
-                            .filter(|l| !l.is_empty())
-                            .map(|l| PickerEntry {
-                                label: l.to_string(),
-                                value: l.to_string(),
-                            })
-                            .collect();
-                    }
-                    return Vec::new();
+                    let output = child.wait_with_output().ok()?;
+                    return Some(String::from_utf8_lossy(&output.stdout).into_owned());
                 }
-                Ok(Some(_)) => return Vec::new(), // non-zero exit
+                Ok(Some(_)) => return None,
                 Ok(None) => {
                     if start.elapsed() >= GIT_SHELL_BUDGET {
                         let _ = child.kill();
-                        return Vec::new();
+                        return None;
                     }
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                Err(_) => return Vec::new(),
+                Err(_) => return None,
             }
         }
     }
-    Vec::new()
+    None
+}
+
+/// Local branches + tags as short names (`main`, `v1.2.3`, `feature/foo`).
+/// Empty on non-repos, empty repos, or shell-out failure.
+fn gather_refs(cwd: &Path) -> Vec<PickerEntry> {
+    let Some(stdout) = run_git(
+        cwd,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/tags",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| PickerEntry {
+            label: l.to_string(),
+            value: l.to_string(),
+        })
+        .collect()
+}
+
+/// Stash entries. Each `git stash list` line looks like:
+///   `stash@{0}: WIP on main: abc123 Commit message`
+/// Value is the `stash@{N}` prefix (which needs shell-quoting since it
+/// contains `{}`); label is the whole line so the user can disambiguate.
+fn gather_stash(cwd: &Path) -> Vec<PickerEntry> {
+    let Some(stdout) = run_git(cwd, &["stash", "list"]) else {
+        return Vec::new();
+    };
+    stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| {
+            let colon = l.find(':')?;
+            let stash_ref = &l[..colon];
+            if !stash_ref.starts_with("stash@{") || !stash_ref.ends_with('}') {
+                return None;
+            }
+            Some(PickerEntry {
+                label: l.to_string(),
+                value: stash_ref.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Configured remote names (`origin`, `upstream`, etc.) from `git remote`.
+/// Repos without remotes return empty, which dispatch treats as "no popup".
+fn gather_remotes(cwd: &Path) -> Vec<PickerEntry> {
+    let Some(stdout) = run_git(cwd, &["remote"]) else {
+        return Vec::new();
+    };
+    stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| PickerEntry {
+            label: l.to_string(),
+            value: l.to_string(),
+        })
+        .collect()
+}
+
+/// Changed / untracked files from `git status --porcelain=v1 -z`. Paths are
+/// reported relative to the current directory (git's `-C` sets cwd), so
+/// pasting them straight into the shell works without any path-normalizing.
+fn gather_files(cwd: &Path) -> Vec<PickerEntry> {
+    let Some(stdout) = run_git(cwd, &["status", "--porcelain=v1", "-z"]) else {
+        return Vec::new();
+    };
+    parse_porcelain(stdout.as_bytes())
+}
+
+/// Parse `git status --porcelain=v1 -z` output into picker entries.
+///
+/// Porcelain v1 `-z` format:
+///   `XY<space>PATH\0` for normal records.
+///   `RX<space>NEW_PATH\0OLD_PATH\0` for renames (and `CX` for copies) —
+///   two NUL-separated records where the second holds the pre-rename name.
+///
+/// Extracted as a pure function so we can unit-test the parser without
+/// shelling out to a real git repo. The caller of `gather_files` owns the
+/// subprocess; this just handles bytes.
+fn parse_porcelain(bytes: &[u8]) -> Vec<PickerEntry> {
+    let records: Vec<&[u8]> = bytes
+        .split(|&b| b == 0)
+        .filter(|r| !r.is_empty())
+        .collect();
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < records.len() {
+        let record = records[i];
+        // Valid record is at minimum `XY<space>c` — 4 bytes with a 1-char
+        // path. Skip anything shorter.
+        if record.len() < 4 {
+            i += 1;
+            continue;
+        }
+        let xy = &record[..2];
+        let path = String::from_utf8_lossy(&record[3..]).into_owned();
+        let xy_str = String::from_utf8_lossy(xy).into_owned();
+        out.push(PickerEntry {
+            label: format!("{xy_str} {path}"),
+            value: path,
+        });
+        // Rename (R) / copy (C) records are followed by an extra record
+        // holding the old path. Skip it so the pre-rename name doesn't
+        // surface as a separate candidate.
+        let is_rename_or_copy = xy[0] == b'R' || xy[0] == b'C';
+        i += if is_rename_or_copy { 2 } else { 1 };
+    }
+    out
 }
 
 #[cfg(test)]
@@ -210,8 +393,20 @@ mod tests {
         for sub in REF_SUBCOMMANDS {
             let line = format!("git {sub}");
             assert_eq!(
-                detect_git_ref_subcommand_strict(&line),
-                Some(*sub),
+                detect_git_picker_strict(&line),
+                Some(GitPickerKind::Refs),
+                "strict should accept `{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_accepts_each_stash_action() {
+        for action in STASH_ACTIONS {
+            let line = format!("git stash {action}");
+            assert_eq!(
+                detect_git_picker_strict(&line),
+                Some(GitPickerKind::Stash),
                 "strict should accept `{line}`"
             );
         }
@@ -220,52 +415,72 @@ mod tests {
     #[test]
     fn strict_accepts_leading_whitespace() {
         assert_eq!(
-            detect_git_ref_subcommand_strict("  git checkout"),
-            Some("checkout")
+            detect_git_picker_strict("  git checkout"),
+            Some(GitPickerKind::Refs)
         );
         assert_eq!(
-            detect_git_ref_subcommand_strict("\tgit\tswitch"),
-            Some("switch")
+            detect_git_picker_strict("\tgit\tswitch"),
+            Some(GitPickerKind::Refs)
+        );
+        assert_eq!(
+            detect_git_picker_strict("  git stash pop"),
+            Some(GitPickerKind::Stash)
         );
     }
 
     #[test]
     fn strict_rejects_non_git_first_token() {
-        assert_eq!(detect_git_ref_subcommand_strict(""), None);
-        assert_eq!(detect_git_ref_subcommand_strict("git"), None);
-        assert_eq!(detect_git_ref_subcommand_strict("gitcheckout"), None);
-        assert_eq!(detect_git_ref_subcommand_strict("echo git checkout"), None);
+        assert_eq!(detect_git_picker_strict(""), None);
+        assert_eq!(detect_git_picker_strict("git"), None);
+        assert_eq!(detect_git_picker_strict("gitcheckout"), None);
+        assert_eq!(detect_git_picker_strict("echo git checkout"), None);
+        assert_eq!(detect_git_picker_strict("echo git stash pop"), None);
     }
 
     #[test]
     fn strict_rejects_non_whitelisted_subcommand() {
-        assert_eq!(detect_git_ref_subcommand_strict("git status"), None);
-        assert_eq!(detect_git_ref_subcommand_strict("git branch"), None);
-        assert_eq!(detect_git_ref_subcommand_strict("git add"), None);
-        assert_eq!(detect_git_ref_subcommand_strict("git push"), None);
+        assert_eq!(detect_git_picker_strict("git status"), None);
+        assert_eq!(detect_git_picker_strict("git branch"), None);
+        assert_eq!(detect_git_picker_strict("git log"), None);
+        assert_eq!(detect_git_picker_strict("git diff"), None);
     }
 
-    /// A third token means the user is mid-argument (`git checkout foo|`);
+    /// `git stash` alone doesn't take a ref — reject. `git stash list` / `save`
+    /// / `push` aren't picker targets either (they don't consume a stash ref).
+    #[test]
+    fn strict_rejects_bare_stash_and_unknown_action() {
+        assert_eq!(detect_git_picker_strict("git stash"), None);
+        assert_eq!(detect_git_picker_strict("git stash list"), None);
+        assert_eq!(detect_git_picker_strict("git stash save"), None);
+        assert_eq!(detect_git_picker_strict("git stash push"), None);
+    }
+
+    /// A third token (or fourth for stash) means the user is mid-argument;
     /// the strict path should reject so Space doesn't stomp their typing.
     #[test]
     fn strict_rejects_when_arg_present() {
-        assert_eq!(detect_git_ref_subcommand_strict("git checkout foo"), None);
-        assert_eq!(detect_git_ref_subcommand_strict("git merge main dev"), None);
+        assert_eq!(detect_git_picker_strict("git checkout foo"), None);
+        assert_eq!(detect_git_picker_strict("git merge main dev"), None);
+        assert_eq!(detect_git_picker_strict("git stash pop stash@{0}"), None);
     }
 
     #[test]
     fn heuristic_accepts_with_leading_prompt_text() {
         assert_eq!(
-            detect_git_ref_subcommand_heuristic("~ $ git checkout"),
-            Some("checkout")
+            detect_git_picker_heuristic("~ $ git checkout"),
+            Some(GitPickerKind::Refs)
         );
         assert_eq!(
-            detect_git_ref_subcommand_heuristic("user@host:~/dev $ git merge"),
-            Some("merge")
+            detect_git_picker_heuristic("user@host:~/dev $ git merge"),
+            Some(GitPickerKind::Refs)
         );
         assert_eq!(
-            detect_git_ref_subcommand_heuristic("❯ git rebase"),
-            Some("rebase")
+            detect_git_picker_heuristic("❯ git stash apply"),
+            Some(GitPickerKind::Stash)
+        );
+        assert_eq!(
+            detect_git_picker_heuristic("~ $ git stash drop"),
+            Some(GitPickerKind::Stash)
         );
     }
 
@@ -274,32 +489,144 @@ mod tests {
     #[test]
     fn heuristic_has_known_false_positive_on_git_as_argument() {
         assert_eq!(
-            detect_git_ref_subcommand_heuristic("echo git checkout"),
-            Some("checkout")
+            detect_git_picker_heuristic("echo git checkout"),
+            Some(GitPickerKind::Refs)
+        );
+        assert_eq!(
+            detect_git_picker_heuristic("echo git stash pop"),
+            Some(GitPickerKind::Stash)
         );
     }
 
     #[test]
     fn heuristic_rejects_when_arg_present() {
+        assert_eq!(detect_git_picker_heuristic("git checkout foo"), None);
+        assert_eq!(detect_git_picker_heuristic("~ $ git switch dev"), None);
         assert_eq!(
-            detect_git_ref_subcommand_heuristic("git checkout foo"),
-            None
-        );
-        assert_eq!(
-            detect_git_ref_subcommand_heuristic("~ $ git switch dev"),
+            detect_git_picker_heuristic("git stash pop stash@{0}"),
             None
         );
     }
 
     #[test]
     fn heuristic_rejects_non_whitelisted_subcommand() {
-        assert_eq!(detect_git_ref_subcommand_heuristic("git status"), None);
-        assert_eq!(detect_git_ref_subcommand_heuristic("$ git push"), None);
+        assert_eq!(detect_git_picker_heuristic("git status"), None);
+        assert_eq!(detect_git_picker_heuristic("$ git log"), None);
+        assert_eq!(detect_git_picker_heuristic("git stash save"), None);
     }
 
     #[test]
     fn heuristic_rejects_short_lines() {
-        assert_eq!(detect_git_ref_subcommand_heuristic(""), None);
-        assert_eq!(detect_git_ref_subcommand_heuristic("git"), None);
+        assert_eq!(detect_git_picker_heuristic(""), None);
+        assert_eq!(detect_git_picker_heuristic("git"), None);
+        assert_eq!(detect_git_picker_heuristic("git stash"), None);
+    }
+
+    #[test]
+    fn strict_accepts_each_file_subcommand() {
+        for sub in FILE_SUBCOMMANDS {
+            let line = format!("git {sub}");
+            assert_eq!(
+                detect_git_picker_strict(&line),
+                Some(GitPickerKind::Files),
+                "strict should accept `{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn heuristic_accepts_each_file_subcommand() {
+        for sub in FILE_SUBCOMMANDS {
+            let line = format!("~ $ git {sub}");
+            assert_eq!(
+                detect_git_picker_heuristic(&line),
+                Some(GitPickerKind::Files),
+                "heuristic should accept `{line}`"
+            );
+        }
+    }
+
+    /// Modified + untracked file — one record each, no rename handling.
+    #[test]
+    fn parse_porcelain_simple_records() {
+        let input = b" M foo.rs\0?? new.rs\0";
+        let entries = parse_porcelain(input);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].label, " M foo.rs");
+        assert_eq!(entries[0].value, "foo.rs");
+        assert_eq!(entries[1].label, "?? new.rs");
+        assert_eq!(entries[1].value, "new.rs");
+    }
+
+    /// Rename: the second NUL-separated record is the old name — it must
+    /// NOT become a separate picker entry.
+    #[test]
+    fn parse_porcelain_rename_skips_old_name() {
+        let input = b"R  new.rs\0old.rs\0 M unrelated.rs\0";
+        let entries = parse_porcelain(input);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].label, "R  new.rs");
+        assert_eq!(entries[0].value, "new.rs");
+        assert_eq!(entries[1].label, " M unrelated.rs");
+        assert_eq!(entries[1].value, "unrelated.rs");
+    }
+
+    /// Copy records (C in index status) follow the same two-record shape
+    /// as renames — the old path should be skipped too.
+    #[test]
+    fn parse_porcelain_copy_skips_source() {
+        let input = b"C  dest.rs\0src.rs\0";
+        let entries = parse_porcelain(input);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value, "dest.rs");
+    }
+
+    /// Paths can contain whitespace — porcelain -z emits them unquoted
+    /// so the whole byte range after `XY ` is the path.
+    #[test]
+    fn parse_porcelain_path_with_space() {
+        let input = b" M has space.rs\0";
+        let entries = parse_porcelain(input);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value, "has space.rs");
+    }
+
+    /// Empty stdout (clean worktree): zero entries, no crash.
+    #[test]
+    fn parse_porcelain_empty_input() {
+        assert!(parse_porcelain(b"").is_empty());
+        assert!(parse_porcelain(b"\0\0").is_empty());
+    }
+
+    #[test]
+    fn strict_accepts_each_remote_subcommand() {
+        for sub in REMOTE_SUBCOMMANDS {
+            let line = format!("git {sub}");
+            assert_eq!(
+                detect_git_picker_strict(&line),
+                Some(GitPickerKind::Remotes),
+                "strict should accept `{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn heuristic_accepts_each_remote_subcommand() {
+        for sub in REMOTE_SUBCOMMANDS {
+            let line = format!("~ $ git {sub}");
+            assert_eq!(
+                detect_git_picker_heuristic(&line),
+                Some(GitPickerKind::Remotes),
+                "heuristic should accept `{line}`"
+            );
+        }
+    }
+
+    /// Remote-taking subcommands still reject a trailing argument (the user
+    /// is mid-type: `git push ori|`).
+    #[test]
+    fn strict_rejects_remote_with_arg_present() {
+        assert_eq!(detect_git_picker_strict("git push origin"), None);
+        assert_eq!(detect_git_picker_strict("git pull upstream main"), None);
     }
 }
