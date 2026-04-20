@@ -37,13 +37,13 @@ ben-term/
 | Feature | Spec | Description |
 |---------|------|-------------|
 | WezTerm core | (upstream) | Full terminal emulator: PTY, VT parsing, GPU rendering, tabs, panes, fonts, config |
+| Git picker | [features/git-picker.md](features/git-picker.md) | `git <sub>` + Space dropdown. Phases 1–5 shipped (refs, stash, files, remotes, commits) |
 
 ## Active Features
 
 | Feature | Spec | Description |
 |---------|------|-------------|
 | Context dropdowns | [features/context-dropdowns.md](features/context-dropdowns.md) | Shared infra (popup shell, trigger helpers) + `cd` picker. v1/v2/v3 shipped (incl. click-away, flip-above) |
-| Git picker | [features/git-picker.md](features/git-picker.md) | `git <sub>` + Space dropdown. Phases 1–4 shipped (refs, stash, files, remotes); commit-hash picker still planned |
 
 ## Planned Features
 
