@@ -11,6 +11,8 @@
 //!                 → entries from `stash list`
 //!   - `Files`   — `add` / `rm` / `reset` / `restore`
 //!                 → changed / untracked paths from `status --porcelain -z`
+//!   - `Remotes` — `push` / `pull` / `fetch`
+//!                 → configured remote names from `git remote`
 //!
 //! Dispatch: the key assignment `ActivateContextDropdown(Cd)` fans out through
 //! `cd::try_activate` → `git::try_activate`. The `Cd` variant name is
@@ -50,6 +52,14 @@ const STASH_ACTIONS: &[&str] = &["pop", "apply", "drop", "show"];
 /// they'd press Enter, not Space.
 const FILE_SUBCOMMANDS: &[&str] = &["add", "rm", "reset", "restore"];
 
+/// Git subcommands whose next argument is a remote name.
+///
+/// All three accept an optional remote as the first positional arg
+/// (`git push origin`, `git pull upstream`, etc.). Pressing Space after the
+/// bare subcommand offers the configured remotes; Escape falls back to
+/// typing options like `-u` manually.
+const REMOTE_SUBCOMMANDS: &[&str] = &["push", "pull", "fetch"];
+
 const GIT_SHELL_BUDGET: Duration = Duration::from_millis(250);
 
 /// Which flavor of git picker to open. Trigger detection returns this so
@@ -60,6 +70,7 @@ enum GitPickerKind {
     Refs,
     Stash,
     Files,
+    Remotes,
 }
 
 impl GitPickerKind {
@@ -68,6 +79,7 @@ impl GitPickerKind {
             Self::Refs => gather_refs(cwd),
             Self::Stash => gather_stash(cwd),
             Self::Files => gather_files(cwd),
+            Self::Remotes => gather_remotes(cwd),
         }
     }
 }
@@ -151,6 +163,8 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
 ///   - `git <sub>` with no third token, where `<sub>` ∈ REF_SUBCOMMANDS → Refs
 ///   - `git <sub>` with no third token, where `<sub>` ∈ FILE_SUBCOMMANDS
 ///     → Files
+///   - `git <sub>` with no third token, where `<sub>` ∈ REMOTE_SUBCOMMANDS
+///     → Remotes
 ///   - `git stash <action>` with no fourth token, where `<action>` ∈
 ///     STASH_ACTIONS → Stash
 ///
@@ -184,6 +198,9 @@ fn classify_two_token(sub: &str) -> Option<GitPickerKind> {
     }
     if FILE_SUBCOMMANDS.contains(&sub) {
         return Some(GitPickerKind::Files);
+    }
+    if REMOTE_SUBCOMMANDS.contains(&sub) {
+        return Some(GitPickerKind::Remotes);
     }
     None
 }
@@ -299,6 +316,22 @@ fn gather_stash(cwd: &Path) -> Vec<PickerEntry> {
         .collect()
 }
 
+/// Configured remote names (`origin`, `upstream`, etc.) from `git remote`.
+/// Repos without remotes return empty, which dispatch treats as "no popup".
+fn gather_remotes(cwd: &Path) -> Vec<PickerEntry> {
+    let Some(stdout) = run_git(cwd, &["remote"]) else {
+        return Vec::new();
+    };
+    stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| PickerEntry {
+            label: l.to_string(),
+            value: l.to_string(),
+        })
+        .collect()
+}
+
 /// Changed / untracked files from `git status --porcelain=v1 -z`. Paths are
 /// reported relative to the current directory (git's `-C` sets cwd), so
 /// pasting them straight into the shell works without any path-normalizing.
@@ -409,7 +442,7 @@ mod tests {
         assert_eq!(detect_git_picker_strict("git status"), None);
         assert_eq!(detect_git_picker_strict("git branch"), None);
         assert_eq!(detect_git_picker_strict("git log"), None);
-        assert_eq!(detect_git_picker_strict("git push"), None);
+        assert_eq!(detect_git_picker_strict("git diff"), None);
     }
 
     /// `git stash` alone doesn't take a ref — reject. `git stash list` / `save`
@@ -478,7 +511,7 @@ mod tests {
     #[test]
     fn heuristic_rejects_non_whitelisted_subcommand() {
         assert_eq!(detect_git_picker_heuristic("git status"), None);
-        assert_eq!(detect_git_picker_heuristic("$ git push"), None);
+        assert_eq!(detect_git_picker_heuristic("$ git log"), None);
         assert_eq!(detect_git_picker_heuristic("git stash save"), None);
     }
 
@@ -563,5 +596,37 @@ mod tests {
     fn parse_porcelain_empty_input() {
         assert!(parse_porcelain(b"").is_empty());
         assert!(parse_porcelain(b"\0\0").is_empty());
+    }
+
+    #[test]
+    fn strict_accepts_each_remote_subcommand() {
+        for sub in REMOTE_SUBCOMMANDS {
+            let line = format!("git {sub}");
+            assert_eq!(
+                detect_git_picker_strict(&line),
+                Some(GitPickerKind::Remotes),
+                "strict should accept `{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn heuristic_accepts_each_remote_subcommand() {
+        for sub in REMOTE_SUBCOMMANDS {
+            let line = format!("~ $ git {sub}");
+            assert_eq!(
+                detect_git_picker_heuristic(&line),
+                Some(GitPickerKind::Remotes),
+                "heuristic should accept `{line}`"
+            );
+        }
+    }
+
+    /// Remote-taking subcommands still reject a trailing argument (the user
+    /// is mid-type: `git push ori|`).
+    #[test]
+    fn strict_rejects_remote_with_arg_present() {
+        assert_eq!(detect_git_picker_strict("git push origin"), None);
+        assert_eq!(detect_git_picker_strict("git pull upstream main"), None);
     }
 }
