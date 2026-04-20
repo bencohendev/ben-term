@@ -1,6 +1,6 @@
 # Context Dropdowns
 
-**Status:** Active — v1/v2/v3 shipped for `cd`; `PopupPicker` (shared popup shell) and PTY-echo input model shipped alongside git picker Phase 1. Spec now primarily covers shared infrastructure + the cd picker; per-command pickers live in their own specs (see [git-picker.md](git-picker.md)).
+**Status:** Active — v1/v2/v3 shipped for `cd` (including the v3 polish follow-ups: click-away dismiss and flip-above on bottom overflow; hiding the pane cursor was tried and rejected under the PTY-echo model); `PopupPicker` (shared popup shell) and PTY-echo input model shipped alongside git picker Phase 1. Spec now primarily covers shared infrastructure + the cd picker; per-command pickers live in their own specs (see [git-picker.md](git-picker.md)).
 
 ## Overview
 
@@ -194,11 +194,13 @@ Anchored below and left-aligned to the cursor so the popup feels like a contextu
 - [x] `cargo clippy --no-deps -p wezterm-gui` clean on our module (pre-existing workspace debt in `inputmap.rs` unchanged, out of scope)
 - [x] Manual QA: popup opens below the shell cursor, half-width, rounded border visible; shell prompt + output still visible around it; Enter pastes `cd <path>`; Escape dismisses; Resize while open relayouts
 
-### Known follow-ups (out of scope for v3)
+### v3 polish follow-ups
 
-- Click-away dismiss (palette doesn't do it either — would add in `Modal::mouse_event`)
-- If cursor is near the bottom of the window, the popup may extend below the visible grid. Could flip to anchor *above* cursor on that edge case — deferred until it bites
-- Pane cursor stays visible under the popup (palette precedent). Fine for now; can be hidden via a cursor-visibility hook if it visually clashes
+| Follow-up | Status | Mechanism / Rationale |
+|-----------|--------|-----------------------|
+| Click-away dismiss | Shipped | New `Modal::mouse_press_pixel(point, &TermWindow) -> bool`. `TermWindow::mouse_event_impl` intercepts every mouse press before dispatch and calls the modal. `PopupPicker` hit-tests the cached computed-element bounds: miss → `cancel_modal()` + consume; hit → pass through. Upstream modals keep the default no-op, preserving current behavior. |
+| Flip above cursor on bottom overflow | Shipped | `compute()` runs layout once with the below-cursor anchor, checks `computed.bounds.max_y() > grid_bottom_y`, and — only if the above-cursor side has *more* room — translates the element up by `above_anchor_y - below_anchor_y`. Bottom-cut is preserved when the window is cramped top and bottom, since under fuzzy ordering the top rows are the higher-ranked matches. |
+| Hide pane cursor while popup open | **Rejected** | Tried via a `Modal::hides_pane_cursor()` hook gating `CursorVisibility` inside `compute_cell_fg_bg`, then reverted. Under the PTY-echo input model the shell caret *is* the real cursor for the filter text the user is typing — hiding it contradicts the "one cursor, in the shell" principle. Below-cursor anchoring means the caret sits one row above the popup and doesn't visually clash in practice; the flip-above case does put the caret under the popup, but not often enough to justify the contradiction. |
 
 ## Shared `PopupPicker` — PTY-echo input model (shipped alongside git picker Phase 1)
 
@@ -216,7 +218,7 @@ During the git picker work the popup's input handling was reworked so the shell 
 
 ### Code changes
 
-- Dropped `filter_cursor` field + all positional editing (`filter_left/right/home/end/filter_delete` + Ctrl-A/E/B/F handlers). The popup is append-only now; positional edits happen in the shell.
+- Dropped `filter_cursor` field + all positional editing (`filter_left/right/home/end/filter_delete` + Ctrl-A/E/B/F handlers). The popup is append-only now; positional edits happen in the shell — Left/Right/Home/End and Ctrl-A/E/B/F are forwarded to the PTY so the shell caret moves. (Forwarding was missed in the initial refactor and added during the v3 follow-ups after a regression report.)
 - Added `PopupPicker::forward_to_pane(key, mods)` and `PopupPicker::send_backspaces(n)` helpers.
 - `cd::try_activate` and `git::try_activate` now call `pane.key_down(KeyCode::Char(' '), KeyModifiers::NONE)` immediately after `set_modal`.
 - Enter handler pastes without the leading space.

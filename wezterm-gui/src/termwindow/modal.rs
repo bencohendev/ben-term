@@ -25,5 +25,14 @@ pub trait Modal: Downcast {
         term_window: &mut TermWindow,
     ) -> anyhow::Result<Ref<'_, [ComputedElement]>>;
     fn reconfigure(&self, term_window: &mut TermWindow);
+
+    /// Called on every window-level mouse press (pixel coords relative to
+    /// the window origin). Default: don't consume. Return true to consume
+    /// the event so it doesn't dispatch further. ben-term popup pickers
+    /// override this for click-away dismiss; upstream modals keep the
+    /// default.
+    fn mouse_press_pixel(&self, _point: (f32, f32), _term_window: &TermWindow) -> bool {
+        false
+    }
 }
 impl_downcast!(Modal);

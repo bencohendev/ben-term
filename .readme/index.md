@@ -42,7 +42,7 @@ ben-term/
 
 | Feature | Spec | Description |
 |---------|------|-------------|
-| Context dropdowns | [features/context-dropdowns.md](features/context-dropdowns.md) | Shared infra (popup shell, trigger helpers) + `cd` picker. v1/v2/v3 shipped |
+| Context dropdowns | [features/context-dropdowns.md](features/context-dropdowns.md) | Shared infra (popup shell, trigger helpers) + `cd` picker. v1/v2/v3 shipped (incl. click-away, flip-above) |
 | Git picker | [features/git-picker.md](features/git-picker.md) | `git <sub>` + Space dropdown. Phase 1 (refs: checkout/switch/merge/rebase/cherry-pick) shipped |
 
 ## Planned Features

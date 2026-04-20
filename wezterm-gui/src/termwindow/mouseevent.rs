@@ -67,6 +67,20 @@ impl super::TermWindow {
 
         self.current_mouse_event.replace(event.clone());
 
+        // Give the active modal (if any) first crack at mouse presses.
+        // Used by ben-term popup pickers for click-away dismiss: clicks
+        // outside the popup cancel the modal and are consumed so they
+        // don't fall through to the pane underneath. Upstream modals
+        // keep the default no-op impl and let the click fall through.
+        if matches!(event.kind, WMEK::Press(_)) {
+            if let Some(modal) = self.get_modal() {
+                let pt = (event.coords.x as f32, event.coords.y as f32);
+                if modal.mouse_press_pixel(pt, self) {
+                    return;
+                }
+            }
+        }
+
         let border = self.get_os_border();
 
         let first_line_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {

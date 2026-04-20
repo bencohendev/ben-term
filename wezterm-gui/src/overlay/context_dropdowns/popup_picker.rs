@@ -267,11 +267,13 @@ impl PopupPicker {
         let max_x_px = padding_left + avail_pixel_width - desired_pixel_width;
         let anchor_x = cursor_x_px.min(max_x_px).max(padding_left);
 
-        // Anchor Y: one row below the cursor row. Negative viewport_row means
-        // the cursor has scrolled above the visible area — rare, but clamp to
-        // the top of the grid so the popup stays visible.
+        // Anchor Y: one row below the cursor row by default. Negative
+        // viewport_row means the cursor has scrolled above the visible
+        // area — rare, but clamp to the top of the grid so the popup
+        // stays visible.
         let cursor_row = self.cursor_viewport_row.max(0) as f32;
-        let anchor_y = grid_origin_y + (cursor_row + 1.) * cell_h;
+        let below_anchor_y = grid_origin_y + (cursor_row + 1.) * cell_h;
+        let anchor_y = below_anchor_y;
 
         let element = Element::new(&font, ElementContent::Children(rows))
             .colors(ElementColors {
@@ -313,7 +315,7 @@ impl PopupPicker {
             .min_width(Some(Dimension::Pixels(desired_pixel_width)))
             .max_width(Some(Dimension::Pixels(desired_pixel_width)));
 
-        let computed = term_window.compute_element(
+        let mut computed = term_window.compute_element(
             &LayoutContext {
                 height: DimensionContext {
                     dpi: dimensions.dpi as f32,
@@ -338,7 +340,36 @@ impl PopupPicker {
             &element,
         )?;
 
+        // Flip above the cursor when the below-anchored popup would
+        // overflow the grid bottom. Only flips if the above position
+        // actually has more vertical room — otherwise the popup stays
+        // below (bottom-cut is usually better than top-cut because the
+        // top rows are the higher-ranked matches under fuzzy ordering).
+        let grid_bottom_y = grid_origin_y + size.rows as f32 * cell_h;
+        let popup_height = computed.bounds.height();
+        if computed.bounds.max_y() > grid_bottom_y {
+            let cursor_top_y = grid_origin_y + cursor_row * cell_h;
+            let above_anchor_y = cursor_top_y - popup_height;
+            let room_above = cursor_top_y - grid_origin_y;
+            let room_below = grid_bottom_y - below_anchor_y;
+            if room_above > room_below {
+                let delta = above_anchor_y - below_anchor_y;
+                computed.translate(euclid::vec2(0., delta));
+            }
+        }
+
         Ok(vec![computed])
+    }
+
+    /// Hit-test the most recently computed popup bounds against a
+    /// pixel point. Returns `None` if the popup hasn't painted yet
+    /// (the cached element hasn't been built) — callers should treat
+    /// an unpainted popup as "no defined bounds".
+    fn hit_test(&self, point: (f32, f32)) -> Option<bool> {
+        let element = self.element.borrow();
+        let first = element.as_ref()?.first()?;
+        let pt = euclid::point2(point.0, point.1);
+        Some(first.bounds.contains(pt))
     }
 }
 
@@ -360,6 +391,21 @@ fn compute_matches(selection: &str, entries: &[PickerEntry]) -> Vec<usize> {
 impl Modal for PopupPicker {
     fn mouse_event(&self, _event: MouseEvent, _term_window: &mut TermWindow) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Click-away dismiss. A press outside the popup bounds cancels the
+    /// modal and is consumed so the shell underneath doesn't also react.
+    /// A press inside the popup is left untouched (future work: row
+    /// click-to-select). If the popup hasn't painted yet we can't
+    /// hit-test — in that rare case, don't consume.
+    fn mouse_press_pixel(&self, point: (f32, f32), term_window: &TermWindow) -> bool {
+        match self.hit_test(point) {
+            Some(false) => {
+                term_window.cancel_modal();
+                true
+            }
+            _ => false,
+        }
     }
 
     fn key_down(
@@ -396,6 +442,20 @@ impl Modal for PopupPicker {
                 for _ in 0..step {
                     self.move_down();
                 }
+            }
+            // Positional edits (Left/Right/Home/End and their Ctrl-B/F/A/E
+            // equivalents) happen in the shell under the PTY-echo model —
+            // the popup has no internal cursor. Forward them so the shell
+            // caret moves; the popup filter stays append-only.
+            (KeyCode::LeftArrow, KeyModifiers::NONE)
+            | (KeyCode::RightArrow, KeyModifiers::NONE)
+            | (KeyCode::Home, KeyModifiers::NONE)
+            | (KeyCode::End, KeyModifiers::NONE)
+            | (KeyCode::Char('b'), KeyModifiers::CTRL)
+            | (KeyCode::Char('f'), KeyModifiers::CTRL)
+            | (KeyCode::Char('a'), KeyModifiers::CTRL)
+            | (KeyCode::Char('e'), KeyModifiers::CTRL) => {
+                self.forward_to_pane(key, mods);
             }
             (KeyCode::Backspace, KeyModifiers::NONE) | (KeyCode::Delete, KeyModifiers::NONE) => {
                 // Always forward to the shell so the echoed character gets
