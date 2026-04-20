@@ -13,7 +13,22 @@ pub mod popup_picker;
 
 use mux::pane::Pane;
 use std::sync::Arc;
+use std::time::Duration;
 use wezterm_term::SemanticType;
+
+/// Minimum wall-clock time the "Loading…" placeholder must be visible
+/// before a fast gather result can swap into the popup.
+///
+/// Without this floor, categories whose shell-out completes in a few ms
+/// (e.g. `git for-each-ref` on a small repo) beat the first paint: the
+/// popup opens already containing results, the Loading placeholder never
+/// renders, and the subprocess latency — still real — shows up as
+/// "keypress felt laggy and no indicator."
+///
+/// 80 ms ≈ 5 frames at 60 Hz. Above the ~50 ms threshold where a single
+/// frame of placeholder might flicker unseen, below the ~100 ms threshold
+/// where added delay starts to feel unresponsive.
+pub(super) const MIN_LOADING_VISIBLE: Duration = Duration::from_millis(80);
 
 /// Outcome of a trigger attempt. Mirrors `PerformAssignmentResult` semantics
 /// so it can be returned directly from `perform_key_assignment` dispatch.

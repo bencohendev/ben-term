@@ -22,6 +22,7 @@
 use crate::overlay::context_dropdowns::popup_picker::{PickerEntry, PopupPicker};
 use crate::overlay::context_dropdowns::{
     split_input_zone_at_cursor, split_logical_line_at_cursor, TriggerResult,
+    MIN_LOADING_VISIBLE,
 };
 use crate::termwindow::{TermWindow, TermWindowNotif};
 use mux::pane::Pane;
@@ -101,6 +102,7 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
     // (zoxide subprocess + BFS walk of $HOME) can take a few hundred ms and
     // users perceive that as lag. Gathering runs on a worker thread and the
     // results are swapped in via `TermWindowNotif::Apply` when ready.
+    let open_time = Instant::now();
     let picker = PopupPicker::new_loading(pane_id, cursor.x, cursor_viewport_row);
     let picker_id = picker.id();
     term_window.set_modal(Rc::new(picker));
@@ -129,6 +131,13 @@ pub fn try_activate(term_window: &mut TermWindow, pane: &Arc<dyn Pane>) -> Trigg
             max_depth,
             include_home,
         );
+        // Hold the Loading placeholder for at least one visible paint even
+        // if the gather beat the first vsync (rare for cd — the walk budget
+        // is 500 ms — but kept symmetric with git.rs for consistent UX).
+        let elapsed = open_time.elapsed();
+        if elapsed < MIN_LOADING_VISIBLE {
+            std::thread::sleep(MIN_LOADING_VISIBLE - elapsed);
+        }
         if let Some(window) = window {
             window.notify(TermWindowNotif::Apply(Box::new(
                 move |tw: &mut TermWindow| {
