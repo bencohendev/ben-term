@@ -44,12 +44,12 @@ ben-term/
 | Feature | Spec | Description |
 |---------|------|-------------|
 | Context dropdowns | [features/context-dropdowns.md](features/context-dropdowns.md) | Shared infra (popup shell, trigger helpers) + `cd` picker. v1/v2/v3 shipped (incl. click-away, flip-above) |
+| Rich theming | [features/rich-theming.md](features/rich-theming.md) | Structured theme format (extends TOML color schemes) + semantic-zone tinting (input/output/prompt). Milestone 1 in flight |
 
 ## Planned Features
 
 | Feature | Description |
 |---------|-------------|
-| Rich theming | Semantic zones (input/output/error tinting), Claude Code-aware themes, per-project auto-switching, hot-reloadable CSS-like config layer |
 | Rich search history | Directory-aware filtering, exit code tracking, timestamps + duration, output preview snippets, frecent ranking |
 | Workspaces & layouts | Named workspaces with pre-configured tab/split layouts, layout persistence across restarts, project-aware tab grouping |
 | Command blocks | Visually group each command + output as a discrete unit — collapsible, copyable, re-runnable |
