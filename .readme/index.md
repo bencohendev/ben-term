@@ -38,7 +38,7 @@ ben-term/
 |---------|------|-------------|
 | WezTerm core | (upstream) | Full terminal emulator: PTY, VT parsing, GPU rendering, tabs, panes, fonts, config |
 | Git picker | [features/git-picker.md](features/git-picker.md) | `git <sub>` + Space dropdown. Phases 1–5 shipped (refs, stash, files, remotes, commits) |
-| Rich theming | [features/rich-theming.md](features/rich-theming.md) | TOML `[semantic_zones]` section tints cell backgrounds by OSC 133 zone (input/output/prompt). Milestone 1 shipped |
+| Rich theming | [features/rich-theming.md](features/rich-theming.md) | TOML `[semantic_zones]` section tints cell backgrounds by OSC 133 zone (input/output/prompt). Milestones 1 + 4a shipped (tinting + interactive theme builder for semantic zones) |
 
 ## Active Features
 

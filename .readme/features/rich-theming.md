@@ -1,6 +1,6 @@
 # Rich Theming
 
-**Status:** Active — milestone 1 (structured theme format + semantic-zone tinting) shipped; milestone 4a (interactive theme builder — semantic zones) starting now.
+**Status:** Done for now — milestone 1 (structured theme format + semantic-zone tinting) and milestone 4a (interactive theme builder — semantic zones) shipped. Future milestones under Scope remain deferred.
 
 ## Overview
 
@@ -135,17 +135,30 @@ Inline Modal UI to edit the active scheme's `[semantic_zones]` section. File-on-
 | `wezterm-gui/src/overlay/theme_builder/file_ops.rs` | **New.** `resolve_active_scheme_path`, `write_zone_color`, `export_builtin` |
 | `config/Cargo.toml` or `wezterm-gui/Cargo.toml` | Add `toml_edit` dependency (put in whichever crate actually calls it — probably the gui crate for 4a, since only the builder writes) |
 
-### Verification (to be filled in after implementation)
+### Verification
 
-- [ ] `cargo build --release` passes
-- [ ] `cargo clippy --workspace -- -D warnings` clean on our modules
-- [ ] `cargo test --workspace` passes (add unit tests for `resolve_active_scheme_path` + `write_zone_color` TOML round-trip)
-- [ ] Bind `ActivateThemeBuilder` to a key, open against `/tmp/ben-term-theming-test/colors/zones-test.toml`
-- [ ] Edit `input_bg`, save → file updated, comments preserved, tint changes live within ~200 ms
-- [ ] Submit empty value for `output_bg` → key removed from TOML, untinted output zone
-- [ ] Invalid hex `#zzz` → rejected, field stays in edit mode
-- [ ] Against a built-in scheme → "Export" row appears; pick it → file created under config colors dir, builder re-opens editable
-- [ ] Escape from editing a field cancels the edit; Escape from row list closes the modal
+- [x] `cargo build --release --bin wezterm-gui` passes
+- [x] `cargo build --bin wezterm-gui` passes
+- [x] `cargo test --bin wezterm-gui theme_builder` — 14/14 passing (row state, edit flow, TOML round-trip incl. comment preservation + empty-table cleanup)
+- [x] `cargo clippy --no-deps -p wezterm-gui` clean on the new module (pre-existing upstream lint debt in `build.rs` and several upstream crates unchanged — same carve-out already documented for the cd/git pickers)
+
+Left for the user to confirm on their setup:
+
+- [ ] Bind `ActivateThemeBuilder` to a key (e.g. `{ key = "t", mods = "CMD|SHIFT", action = wezterm.action.ActivateThemeBuilder }`)
+- [ ] Open against `/tmp/ben-term-theming-test/colors/zones-test.toml` → modal lists three zones with current values + swatches
+- [ ] Edit `input_bg` → TOML updated on disk, comments preserved, tint changes live within ~200 ms
+- [ ] Submit empty value for `output_bg` → key removed from TOML; if it was the last key, `[semantic_zones]` removed too
+- [ ] Invalid hex `#zzz` → rejected with inline error, field stays in edit mode
+- [ ] Against a built-in scheme (e.g. `config.color_scheme = "Builtin Solarized Dark"`) → "Export" row appears; pick it → file created under config colors dir, modal flips into editable mode
+- [ ] Escape from editing a field cancels the edit (keeps modal open); Escape from row list closes the modal
+- [ ] Click outside the modal → dismisses (click-away inherits same contract as PopupPicker)
+
+### Implementation notes (as shipped)
+
+- **Parallel to `PopupPicker`, not shared code.** This mirrors the cd/git picker decision: isolating divergent overlays prevents shared-helper creep that would hurt upstream rebases. The two modules both implement `Modal` and both use the `command_palette_*` color/font config, but they don't share a base type.
+- **`toml_edit` for write-back, `toml` for export.** Edits to an existing file use `toml_edit::DocumentMut` to preserve comments and ordering. The export path (built-in → disk) reuses the existing `ColorSchemeFile::save_to_file` which emits a fresh, formatted file with no user comments to preserve — simpler and already tested.
+- **`[semantic_zones]` table is removed when emptied** so a user who unsets all three fields doesn't see a lingering empty section.
+- **`std::convert::TryFrom` import is required** in `builder.rs` because `wezterm-gui` is edition 2018. Future edition bump would make this redundant.
 
 ## Manual test recipe
 
