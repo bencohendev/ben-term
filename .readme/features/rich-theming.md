@@ -1,6 +1,6 @@
 # Rich Theming
 
-**Status:** Active — milestone 1 implemented and manually verified on `worktree-worktree-rich-theming`; pending merge to `main`.
+**Status:** Active — milestone 1 (structured theme format + semantic-zone tinting) shipped. Future milestones listed under Scope are deferred.
 
 ## Overview
 
@@ -84,12 +84,16 @@ Shells without OSC 133 default every cell to `SemanticType::Output`. With `outpu
 
 - **Cluster homogeneity** — the renderer assumes shaped clusters don't span `SemanticType` boundaries. `wezterm-surface/src/line/line.rs:448-451` breaks zone ranges on `semantic_type` change at the surface level; confirm during implementation that cluster shaping preserves that boundary. Fallback if not: per-cell tint lookup inside the cluster paint (O(1) per cell).
 - **Cursor contrast** — on very dark zone tints with dim cursor themes, the caret may be hard to see. Cursor is drawn above the bg-paint pass, so contrast is preserved, but note as a polish item.
-- **Input-zone cells persist after backspace** — the zone is stored per-cell. When the shell handles backspace by writing a space inside the 133;B region, the cell stays `SemanticType::Input` and therefore stays tinted, so the input tint appears to grow only leftward-to-rightward and never shrink. A future milestone could tint by *current* prompt-row zone instead of per-cell; deferred because the fix is a bigger design change and the behavior is internally consistent with what the shell told the terminal.
+<!-- Input-zone-cells-persist-after-backspace was resolved during milestone 1
+     by trimming trailing blank cells from the Input tint rect — see
+     Implementation notes below. -->
+- **Leading or interior spaces in Input** — spaces inside typed input are still tinted (only the contiguous trailing run of blanks is trimmed), so `"  foo"` tints the leading spaces. Acceptable: typed leading spaces are invisible anyway, and tinting them matches "what the user typed."
 
 ## Implementation notes (milestone 1, as shipped)
 
 - **Hot-reload required a one-line watcher extension.** The spec claimed reload would ride `config_was_reloaded()` "for free", but the existing file watcher only watched `wezterm.lua` and its parent dir (non-recursive), not the color-scheme search path. `ConfigInner::reload()` now also watches every dir returned by `Config::compute_color_scheme_dirs()`, so editing a `*.toml` palette or `[semantic_zones]` block updates the live window within ~200 ms.
 - **`screen_line.rs` has two tint sites**, not one: the cluster loop *and* the pixel-positioning path. Both must apply the tint or font-shaping variants (e.g. ligature-aware positioning) leave cells un-tinted.
+- **Input tint trims trailing blanks.** Shells implement backspace by overwriting the deleted character with a space that stays inside the 133;B region, so the cell remains `SemanticType::Input`. Without a trim the input tint would grow leftward-only and never visually shrink. The paint-site in `screen_line.rs` counts the contiguous trailing run of U+0020 in each Input cluster's text and narrows the tint rect by that many cells. Trim is scoped to Input; Prompt and Output zones paint full-cluster.
 
 ## Manual test recipe
 
@@ -99,4 +103,5 @@ Shells without OSC 133 default every cell to `SemanticType::Output`. With `outpu
 4. Launch ben-term. Observe: prompt line tinted green-ish, typed input tinted red-ish, command output unchanged.
 5. Edit `zones-test.toml`, change `input_bg`, save — tint updates within ~200 ms.
 6. Explicit-bg respected: `printf '\033[41mRED BG\033[0m\n'` (portable; `ls --color=always` is GNU-only and won't run on macOS BSD `ls`). The `RED BG` cells keep their red background — no zone tint overlaid.
-7. Launch with a shell lacking OSC 133 — everything classifies as `Output`. If `output_bg` is unset the screen is untinted; if set, the whole screen is uniformly tinted (graceful — no two-tone artifact).
+7. Backspace doesn't leave tint trails: type `abcdef`, then backspace 3× — the tint shrinks to cover `abc`, not the full 6-cell region.
+8. Launch with a shell lacking OSC 133 — everything classifies as `Output`. If `output_bg` is unset the screen is untinted; if set, the whole screen is uniformly tinted (graceful — no two-tone artifact).

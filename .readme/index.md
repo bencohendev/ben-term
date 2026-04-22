@@ -38,13 +38,13 @@ ben-term/
 |---------|------|-------------|
 | WezTerm core | (upstream) | Full terminal emulator: PTY, VT parsing, GPU rendering, tabs, panes, fonts, config |
 | Git picker | [features/git-picker.md](features/git-picker.md) | `git <sub>` + Space dropdown. Phases 1–5 shipped (refs, stash, files, remotes, commits) |
+| Rich theming | [features/rich-theming.md](features/rich-theming.md) | TOML `[semantic_zones]` section tints cell backgrounds by OSC 133 zone (input/output/prompt). Milestone 1 shipped |
 
 ## Active Features
 
 | Feature | Spec | Description |
 |---------|------|-------------|
 | Context dropdowns | [features/context-dropdowns.md](features/context-dropdowns.md) | Shared infra (popup shell, trigger helpers) + `cd` picker. v1/v2/v3 shipped (incl. click-away, flip-above) |
-| Rich theming | [features/rich-theming.md](features/rich-theming.md) | Structured theme format (extends TOML color schemes) + semantic-zone tinting (input/output/prompt). Milestone 1 in flight |
 
 ## Planned Features
 
