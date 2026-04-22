@@ -86,6 +86,7 @@ termwiz.workspace = true
 textwrap.workspace = true
 thiserror.workspace = true
 tiny-skia.workspace = true
+toml_edit = "0.22"
 umask.workspace = true
 unicode-normalization.workspace = true
 unicode-segmentation.workspace = true

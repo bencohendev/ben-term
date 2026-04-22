@@ -3181,6 +3181,9 @@ impl TermWindow {
                 let modal = crate::termwindow::palette::CommandPalette::new(self);
                 self.set_modal(Rc::new(modal));
             }
+            ActivateThemeBuilder => {
+                crate::overlay::theme_builder::try_activate(self);
+            }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
             Confirmation(args) => self.show_confirmation(args),

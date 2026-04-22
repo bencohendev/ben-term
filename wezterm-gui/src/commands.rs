@@ -2022,6 +2022,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: None,
         },
+        ActivateThemeBuilder => CommandDef {
+            brief: "Activate Theme Builder".into(),
+            doc: "Opens the interactive theme builder for the active color scheme".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["View"],
+            icon: None,
+        },
     })
 }
 
@@ -2067,6 +2075,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivateCommandPalette,
         // ben-term custom: cd picker on Space (guarded, falls through in alt-screen / non-cd lines)
         ActivateContextDropdown(ContextDropdownKind::Cd),
+        ActivateThemeBuilder,
         // ----------------- View
         DecreaseFontSize,
         IncreaseFontSize,
