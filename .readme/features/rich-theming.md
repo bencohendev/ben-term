@@ -1,12 +1,12 @@
 # Rich Theming
 
-**Status:** Active — milestone 1 in flight (structured theme format + semantic-zone tinting).
+**Status:** Active — milestone 1 implemented and manually verified on `worktree-worktree-rich-theming`; pending merge to `main`.
 
 ## Overview
 
 ben-term extends WezTerm's existing TOML color-scheme file format into a structured theme format. A theme file already defines a palette under `[colors]`; this work adds an optional `[semantic_zones]` section that tints cell backgrounds by the cell's `SemanticType` (input / output / prompt, sourced from OSC 133 shell integration). The same file format is the contract a future interactive theme builder will read and write.
 
-Everything hot-reloads via WezTerm's existing `notify` watcher — no new config machinery.
+Everything hot-reloads via WezTerm's existing `notify` watcher. One tiny adjustment was required: the watcher's coverage had to extend to `color_scheme_dirs` (see Implementation notes below).
 
 ## Scope
 
@@ -32,7 +32,7 @@ Everything hot-reloads via WezTerm's existing `notify` watcher — no new config
 | Theme data model | New `Theme { palette, semantic_zones }` wrapper; `Config::color_schemes: HashMap<String, Theme>` | Theme builder will serialize a scheme as one atomic unit. Stapling zones onto `Palette` pollutes a struct reused as the inline `colors` block |
 | Where `SemanticZoneColors` lives | `term/src/color.rs` next to `ColorPalette` | `config` depends on `wezterm-term`, not the other way — placing it in `term` avoids a circular dep. `config` keeps a mirror struct with `FromDynamic`/`ToDynamic` derives for TOML/Lua |
 | How zones reach the renderer | Extend `term::ColorPalette` with a `semantic_zones` field | Every `Pane::palette()` funnels through `config::TermConfig::color_palette()` — one change propagates everywhere |
-| Tinting strategy | Replace cell bg only when `bg_is_default` | Respects explicit bg from shell output (`ls --color`, TUI colors). Users dial weight via the zone color's alpha channel |
+| Tinting strategy | Replace cell bg only when `bg_is_default` | Respects explicit bg from shell output (TUI colors, CSI 48 / SGR background runs). Users dial weight via the zone color's alpha channel |
 | User opt-in | Enabled iff `[semantic_zones]` fields are set | `SemanticZoneColors::default()` is all `None` — absent section is inert. Zero ceremony |
 | Per-window cache | Reuse `TermWindow.palette: Option<ColorPalette>` | Already invalidated by `self.palette.take()` in `config_was_reloaded()`. Zones ride for free |
 | Serde pattern | `FromDynamic` / `ToDynamic` + `impl_lua_conversion_dynamic!` | Codebase-wide convention; `Palette` itself uses it. Avoid `serde::{Serialize, Deserialize}` on these types |
@@ -45,8 +45,8 @@ Everything hot-reloads via WezTerm's existing `notify` watcher — no new config
 |------|--------|
 | `term/src/color.rs` | Add `SemanticZoneColors` struct; extend `ColorPalette` with `semantic_zones` field |
 | `config/src/color.rs` | Add mirror `SemanticZoneColors` (dynamic derives); add `Theme` wrapper; extend `ColorSchemeFile`; add `From<Theme> for ColorPalette`; add `From<Palette> for Theme`; add `ColorSchemeFile::into_theme()` |
-| `config/src/config.rs` | Switch `color_schemes` to `HashMap<String, Theme>`; update `resolve_color_scheme()` to return `Option<&Theme>`; add `resolve_palette()` companion for palette-only callers |
-| `config/src/lib.rs` | `COLOR_SCHEMES` built-in map typed as `HashMap<String, Theme>` (or a lookup wrapper) |
+| `config/src/config.rs` | Switch `color_schemes` to `HashMap<String, Theme>`; `resolve_color_scheme()` now returns `Option<Theme>` (cloned), with a `resolve_palette()` companion for palette-only callers; make `compute_color_scheme_dirs()` pub so the reload path can watch them |
+| `config/src/lib.rs` | `ConfigInner::reload()` adds every `compute_color_scheme_dirs()` dir (that exists) to the notify watch list, so `*.toml` edits hot-reload. `COLOR_SCHEMES` built-ins stay typed as `Palette`; they're wrapped in `Theme` at resolve time — less invasive than re-typing the 1000+ generated entries |
 | `config/src/terminal.rs` | `TermConfig::color_palette()` resolves the full `Theme` and populates `ColorPalette.semantic_zones` |
 | `wezterm-gui/src/termwindow/render/screen_line.rs` | Tint `bg_color` by `SemanticType` when `bg_is_default`; two call sites (cluster loop + pixel-positioning path) |
 
@@ -84,6 +84,12 @@ Shells without OSC 133 default every cell to `SemanticType::Output`. With `outpu
 
 - **Cluster homogeneity** — the renderer assumes shaped clusters don't span `SemanticType` boundaries. `wezterm-surface/src/line/line.rs:448-451` breaks zone ranges on `semantic_type` change at the surface level; confirm during implementation that cluster shaping preserves that boundary. Fallback if not: per-cell tint lookup inside the cluster paint (O(1) per cell).
 - **Cursor contrast** — on very dark zone tints with dim cursor themes, the caret may be hard to see. Cursor is drawn above the bg-paint pass, so contrast is preserved, but note as a polish item.
+- **Input-zone cells persist after backspace** — the zone is stored per-cell. When the shell handles backspace by writing a space inside the 133;B region, the cell stays `SemanticType::Input` and therefore stays tinted, so the input tint appears to grow only leftward-to-rightward and never shrink. A future milestone could tint by *current* prompt-row zone instead of per-cell; deferred because the fix is a bigger design change and the behavior is internally consistent with what the shell told the terminal.
+
+## Implementation notes (milestone 1, as shipped)
+
+- **Hot-reload required a one-line watcher extension.** The spec claimed reload would ride `config_was_reloaded()` "for free", but the existing file watcher only watched `wezterm.lua` and its parent dir (non-recursive), not the color-scheme search path. `ConfigInner::reload()` now also watches every dir returned by `Config::compute_color_scheme_dirs()`, so editing a `*.toml` palette or `[semantic_zones]` block updates the live window within ~200 ms.
+- **`screen_line.rs` has two tint sites**, not one: the cluster loop *and* the pixel-positioning path. Both must apply the tint or font-shaping variants (e.g. ligature-aware positioning) leave cells un-tinted.
 
 ## Manual test recipe
 
@@ -92,5 +98,5 @@ Shells without OSC 133 default every cell to `SemanticType::Output`. With `outpu
 3. Enable OSC 133 in the shell (zsh `precmd` / `preexec` hooks, or an existing oh-my-zsh plugin that emits them).
 4. Launch ben-term. Observe: prompt line tinted green-ish, typed input tinted red-ish, command output unchanged.
 5. Edit `zones-test.toml`, change `input_bg`, save — tint updates within ~200 ms.
-6. `ls --color=always` — colorized filenames keep their explicit bg (no tint over them).
-7. Launch with a shell lacking OSC 133 — screen is untinted (everything reads as `Output`, and `output_bg` is unset).
+6. Explicit-bg respected: `printf '\033[41mRED BG\033[0m\n'` (portable; `ls --color=always` is GNU-only and won't run on macOS BSD `ls`). The `RED BG` cells keep their red background — no zone tint overlaid.
+7. Launch with a shell lacking OSC 133 — everything classifies as `Output`. If `output_bg` is unset the screen is untinted; if set, the whole screen is uniformly tinted (graceful — no two-tone artifact).
