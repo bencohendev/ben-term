@@ -86,6 +86,7 @@ impl Base16Scheme {
                 wezterm_version: None,
                 aliases: vec![],
             },
+            ..Default::default()
         })
     }
 }

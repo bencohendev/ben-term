@@ -1,7 +1,8 @@
 use crate::background::{BackgroundLayer, Gradient};
 use crate::bell::{AudibleBell, EasingFunction, VisualBell};
 use crate::color::{
-    ColorSchemeFile, HsbTransform, Palette, SrgbaTuple, TabBarStyle, WindowFrameConfig,
+    ColorSchemeFile, HsbTransform, Palette, SemanticZoneColors, SrgbaTuple, TabBarStyle, Theme,
+    WindowFrameConfig,
 };
 use crate::daemon::DaemonOptions;
 use crate::exec_domain::ExecDomain;
@@ -188,13 +189,24 @@ pub struct Config {
     #[dynamic(default)]
     pub resolved_palette: Palette,
 
+    /// Resolved semantic-zone tints for the active color scheme.
+    /// Populated alongside `resolved_palette` during config build; each
+    /// field stays `None` unless the active scheme's `semantic_zones`
+    /// block set it.
+    #[dynamic(default)]
+    pub resolved_semantic_zones: SemanticZoneColors,
+
     /// Use a named color scheme rather than the palette specified
     /// by the colors setting.
     pub color_scheme: Option<String>,
 
-    /// Named color schemes
+    /// Named color schemes.
+    /// `Theme` flattens its `palette` field for `FromDynamic`, so existing
+    /// configs that assign flat palette fields (e.g.
+    /// `color_schemes = { MyScheme = { foreground = "..." } }`) keep working.
+    /// Authors may also set a `semantic_zones` sub-table on a scheme.
     #[dynamic(default)]
-    pub color_schemes: HashMap<String, Palette>,
+    pub color_schemes: HashMap<String, Theme>,
 
     /// How many lines of scrollback you want to retain
     #[dynamic(
@@ -1406,8 +1418,9 @@ impl Config {
                         scheme
                     );
                 }
-                Some(p) => {
-                    cfg.resolved_palette = p.clone();
+                Some(theme) => {
+                    cfg.resolved_palette = theme.palette;
+                    cfg.resolved_semantic_zones = theme.semantic_zones;
                 }
             }
         }
@@ -1477,7 +1490,17 @@ impl Config {
                                             name,
                                             path.display()
                                         );
-                                        self.color_schemes.insert(name, scheme.colors);
+                                        // `scheme` is already partially moved (metadata.name
+                                        // was consumed a few lines above), so construct the
+                                        // `Theme` by moving individual fields instead of
+                                        // calling `scheme.into_theme()`.
+                                        self.color_schemes.insert(
+                                            name,
+                                            Theme {
+                                                palette: scheme.colors,
+                                                semantic_zones: scheme.semantic_zones,
+                                            },
+                                        );
                                     }
                                     Err(err) => {
                                         log::error!(
@@ -1497,14 +1520,29 @@ impl Config {
         Ok(())
     }
 
-    pub fn resolve_color_scheme(&self) -> Option<&Palette> {
+    /// Resolve the active `color_scheme` into a full `Theme`
+    /// (palette + semantic zones).
+    ///
+    /// User-defined schemes are stored as `Theme` in `self.color_schemes`;
+    /// bundled built-ins live in `crate::COLOR_SCHEMES` as bare `Palette`
+    /// and are wrapped with default (untinted) semantic zones here.
+    pub fn resolve_color_scheme(&self) -> Option<Theme> {
         let scheme_name = self.color_scheme.as_ref()?;
 
-        if let Some(palette) = self.color_schemes.get(scheme_name) {
-            Some(palette)
+        if let Some(theme) = self.color_schemes.get(scheme_name) {
+            Some(theme.clone())
         } else {
-            crate::COLOR_SCHEMES.get(scheme_name)
+            crate::COLOR_SCHEMES
+                .get(scheme_name)
+                .cloned()
+                .map(Theme::from)
         }
+    }
+
+    /// Convenience: returns just the palette portion of the active theme.
+    /// Kept for callers that don't care about semantic zones.
+    pub fn resolve_palette(&self) -> Option<Palette> {
+        self.resolve_color_scheme().map(|t| t.palette)
     }
 
     pub fn initial_size(&self, dpi: u32, cell_pixel_dims: Option<(usize, usize)>) -> TerminalSize {

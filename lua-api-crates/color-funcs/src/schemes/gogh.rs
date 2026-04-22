@@ -88,6 +88,7 @@ impl GoghTheme {
                     wezterm_version: None,
                     aliases: vec![],
                 },
+                ..Default::default()
             })
         }
         Ok(schemes)

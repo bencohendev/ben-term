@@ -16,7 +16,7 @@ use termwiz::color::LinearRgba;
 use termwiz::surface::CursorShape;
 use wezterm_bidi::Direction;
 use wezterm_term::color::ColorAttribute;
-use wezterm_term::CellAttributes;
+use wezterm_term::{CellAttributes, SemanticType};
 
 impl crate::TermWindow {
     /// "Render" a line of the terminal screen into the vertex buffer.
@@ -219,6 +219,24 @@ impl crate::TermWindow {
                 if attrs.reverse() == !params.dims.reverse_video {
                     std::mem::swap(&mut fg, &mut bg);
                     bg_default = false;
+                }
+
+                // Apply semantic-zone tint (OSC 133 Input/Output/Prompt regions).
+                // Only tint cells that would otherwise paint the default
+                // background — explicit shell-bg cells (ls --color, TUIs)
+                // keep their colors. Users control visual weight via the
+                // zone color's alpha channel in TOML.
+                if bg_default {
+                    let zones = &params.palette.semantic_zones;
+                    let tint = match attrs.semantic_type() {
+                        SemanticType::Input => zones.input_bg,
+                        SemanticType::Output => zones.output_bg,
+                        SemanticType::Prompt => zones.prompt_bg,
+                    };
+                    if let Some(tint) = tint {
+                        bg = tint.to_linear();
+                        bg_default = false;
+                    }
                 }
 
                 (
@@ -788,6 +806,21 @@ impl crate::TermWindow {
                     if attrs.reverse() == !params.reverse_video {
                         std::mem::swap(&mut fg, &mut bg);
                         bg_default = false;
+                    }
+
+                    // Apply semantic-zone tint (OSC 133 Input/Output/Prompt regions).
+                    // Mirrors the cluster-loop path above; see comment there.
+                    if bg_default {
+                        let zones = &params.palette.semantic_zones;
+                        let tint = match attrs.semantic_type() {
+                            SemanticType::Input => zones.input_bg,
+                            SemanticType::Output => zones.output_bg,
+                            SemanticType::Prompt => zones.prompt_bg,
+                        };
+                        if let Some(tint) = tint {
+                            bg = tint.to_linear();
+                            bg_default = false;
+                        }
                     }
 
                     // Check for blink, and if this is the "not-visible"

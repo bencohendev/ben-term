@@ -6,7 +6,7 @@ use termwiz::cell::CellAttributes;
 use termwiz::color::ColorSpec as TWColorSpec;
 pub use termwiz::color::{AnsiColor, ColorAttribute, RgbColor, SrgbaTuple};
 use wezterm_dynamic::{FromDynamic, ToDynamic};
-use wezterm_term::color::ColorPalette;
+use wezterm_term::color::{ColorPalette, SemanticZoneColors as TermSemanticZoneColors};
 
 #[derive(Debug, Copy, Clone, FromDynamic, ToDynamic)]
 pub struct HsbTransform {
@@ -313,6 +313,58 @@ impl From<Palette> for ColorPalette {
             p.colors.0[idx as usize] = col.into();
         }
         p
+    }
+}
+
+/// Background tints applied per OSC 133 semantic zone (input / output / prompt).
+/// Any field left as `None` means no tint is applied for that zone.
+#[derive(Default, Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct SemanticZoneColors {
+    pub input_bg: Option<RgbaColor>,
+    pub output_bg: Option<RgbaColor>,
+    pub prompt_bg: Option<RgbaColor>,
+}
+impl_lua_conversion_dynamic!(SemanticZoneColors);
+
+impl From<SemanticZoneColors> for TermSemanticZoneColors {
+    fn from(cfg: SemanticZoneColors) -> Self {
+        Self {
+            input_bg: cfg.input_bg.map(Into::into),
+            output_bg: cfg.output_bg.map(Into::into),
+            prompt_bg: cfg.prompt_bg.map(Into::into),
+        }
+    }
+}
+
+/// A complete theme: palette plus semantic-zone tints.
+/// This is the unit stored in `Config::color_schemes` and the unit a future
+/// theme builder reads/writes as a single file.
+#[derive(Default, Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct Theme {
+    /// Flattened so existing Lua configs that assign flat palette fields
+    /// directly into `color_schemes[name]` (e.g. `foreground = "#fff"`)
+    /// keep parsing without requiring a `palette = {...}` migration.
+    #[dynamic(flatten)]
+    pub palette: Palette,
+    #[dynamic(default)]
+    pub semantic_zones: SemanticZoneColors,
+}
+impl_lua_conversion_dynamic!(Theme);
+
+impl From<Palette> for Theme {
+    fn from(palette: Palette) -> Self {
+        Self {
+            palette,
+            semantic_zones: SemanticZoneColors::default(),
+        }
+    }
+}
+
+impl From<Theme> for ColorPalette {
+    fn from(theme: Theme) -> Self {
+        let mut cp: ColorPalette = theme.palette.into();
+        cp.semantic_zones = theme.semantic_zones.into();
+        cp
     }
 }
 
@@ -690,15 +742,29 @@ pub struct ColorSchemeMetaData {
 }
 impl_lua_conversion_dynamic!(ColorSchemeMetaData);
 
-#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+#[derive(Debug, Default, Clone, PartialEq, FromDynamic, ToDynamic)]
 pub struct ColorSchemeFile {
     /// The color palette
     pub colors: Palette,
     /// Info about the scheme
     #[dynamic(default)]
     pub metadata: ColorSchemeMetaData,
+    /// Optional background tints applied per OSC 133 semantic zone
+    /// (input / output / prompt). Missing or empty section leaves every
+    /// zone untinted.
+    #[dynamic(default)]
+    pub semantic_zones: SemanticZoneColors,
 }
 impl_lua_conversion_dynamic!(ColorSchemeFile);
+
+impl ColorSchemeFile {
+    pub fn into_theme(self) -> Theme {
+        Theme {
+            palette: self.colors,
+            semantic_zones: self.semantic_zones,
+        }
+    }
+}
 
 fn dynamic_to_toml(value: Value) -> anyhow::Result<toml::Value> {
     Ok(match value {
@@ -803,4 +869,97 @@ brights = [ "#8ca6a6" ,"#e5164a" ,"#00b368" ,"#b3694d" ,"#0094f0" ,"#ff5792" ,"#
         scheme.colors.indexed.get(&52),
         Some(&RgbColor::new_8bpc(0xfb, 0xda, 0xda).into())
     );
+}
+
+#[cfg(test)]
+#[test]
+fn test_semantic_zones_full() {
+    let toml = r##"
+[colors]
+ansi = [ "#000000","#c44","#5a5","#cb4","#46b","#a4a","#3bb","#ccc" ]
+brights = [ "#555","#f77","#7d7","#ed7","#79d","#d7d","#7dd","#fff" ]
+
+[semantic_zones]
+input_bg = "#2a1f1f"
+output_bg = "#1f1f1f"
+prompt_bg = "#1f2a1f"
+"##;
+    let scheme = ColorSchemeFile::from_toml_str(toml).unwrap();
+    assert_eq!(
+        scheme.semantic_zones.input_bg,
+        Some(RgbColor::new_8bpc(0x2a, 0x1f, 0x1f).into())
+    );
+    assert_eq!(
+        scheme.semantic_zones.output_bg,
+        Some(RgbColor::new_8bpc(0x1f, 0x1f, 0x1f).into())
+    );
+    assert_eq!(
+        scheme.semantic_zones.prompt_bg,
+        Some(RgbColor::new_8bpc(0x1f, 0x2a, 0x1f).into())
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn test_semantic_zones_legacy_scheme_has_no_zones() {
+    let toml = r##"
+[colors]
+ansi = [ "#000000","#c44","#5a5","#cb4","#46b","#a4a","#3bb","#ccc" ]
+brights = [ "#555","#f77","#7d7","#ed7","#79d","#d7d","#7dd","#fff" ]
+"##;
+    let scheme = ColorSchemeFile::from_toml_str(toml).unwrap();
+    assert_eq!(scheme.semantic_zones, SemanticZoneColors::default());
+    assert!(scheme.semantic_zones.input_bg.is_none());
+    assert!(scheme.semantic_zones.output_bg.is_none());
+    assert!(scheme.semantic_zones.prompt_bg.is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn test_semantic_zones_partial() {
+    let toml = r##"
+[colors]
+ansi = [ "#000000","#c44","#5a5","#cb4","#46b","#a4a","#3bb","#ccc" ]
+brights = [ "#555","#f77","#7d7","#ed7","#79d","#d7d","#7dd","#fff" ]
+
+[semantic_zones]
+input_bg = "#2a1f1f"
+"##;
+    let scheme = ColorSchemeFile::from_toml_str(toml).unwrap();
+    assert_eq!(
+        scheme.semantic_zones.input_bg,
+        Some(RgbColor::new_8bpc(0x2a, 0x1f, 0x1f).into())
+    );
+    assert!(scheme.semantic_zones.output_bg.is_none());
+    assert!(scheme.semantic_zones.prompt_bg.is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn test_theme_flattens_palette_in_dynamic() {
+    use wezterm_dynamic::{FromDynamic, Value};
+    // When a user writes a flat palette under `color_schemes`, Theme's
+    // `#[dynamic(flatten)]` on `palette` must absorb the top-level fields.
+    let mut obj = std::collections::BTreeMap::new();
+    obj.insert(
+        Value::String("ansi".into()),
+        Value::Array(
+            (0..8)
+                .map(|_| Value::String("#000000".into()))
+                .collect(),
+        ),
+    );
+    obj.insert(
+        Value::String("brights".into()),
+        Value::Array(
+            (0..8)
+                .map(|_| Value::String("#ffffff".into()))
+                .collect(),
+        ),
+    );
+    let v = Value::Object(obj.into());
+    let theme = Theme::from_dynamic(&v, Default::default()).unwrap();
+    assert!(theme.palette.ansi.is_some());
+    assert!(theme.palette.brights.is_some());
+    assert_eq!(theme.semantic_zones, SemanticZoneColors::default());
 }

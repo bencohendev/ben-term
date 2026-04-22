@@ -141,7 +141,11 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
         "save_scheme",
         lua.create_function(
             |_, (colors, metadata, file_name): (Palette, ColorSchemeMetaData, String)| {
-                let scheme = ColorSchemeFile { colors, metadata };
+                let scheme = ColorSchemeFile {
+                    colors,
+                    metadata,
+                    ..Default::default()
+                };
                 scheme
                     .save_to_file(file_name)
                     .map_err(|err| mlua::Error::external(format!("{err:#}")))
