@@ -608,6 +608,14 @@ impl ConfigInner {
 
         match config {
             Ok(config) => {
+                // Watch the color-scheme search path so edits to *.toml
+                // files trigger a reload and the renderer picks up the
+                // new palette / semantic-zone tints within ~200 ms.
+                for dir in config.compute_color_scheme_dirs() {
+                    if dir.is_dir() {
+                        watch_paths.push(dir);
+                    }
+                }
                 self.config = Arc::new(config);
                 self.error.take();
                 self.generation += 1;

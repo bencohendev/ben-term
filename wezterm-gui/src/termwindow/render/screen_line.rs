@@ -16,7 +16,7 @@ use termwiz::color::LinearRgba;
 use termwiz::surface::CursorShape;
 use wezterm_bidi::Direction;
 use wezterm_term::color::ColorAttribute;
-use wezterm_term::CellAttributes;
+use wezterm_term::{CellAttributes, SemanticType};
 
 impl crate::TermWindow {
     /// "Render" a line of the terminal screen into the vertex buffer.
@@ -210,10 +210,11 @@ impl crate::TermWindow {
                 &Default::default(),
             );
 
-            let (bg_color, bg_is_default) = {
+            let (bg_color, bg_is_default, tint_trimmed_trailing) = {
                 let mut fg = fg_color;
                 let mut bg = bg_color;
                 let mut bg_default = bg_is_default;
+                let mut trimmed_trailing: usize = 0;
 
                 // Check the line reverse_video flag and flip.
                 if attrs.reverse() == !params.dims.reverse_video {
@@ -221,9 +222,50 @@ impl crate::TermWindow {
                     bg_default = false;
                 }
 
+                // Apply semantic-zone tint (OSC 133 Input/Output/Prompt regions).
+                // Only tint cells that would otherwise paint the default
+                // background — explicit shell-bg cells (TUIs, CSI bg runs)
+                // keep their colors. Users control visual weight via the
+                // zone color's alpha channel in TOML.
+                if bg_default {
+                    let zones = &params.palette.semantic_zones;
+                    let tint = match attrs.semantic_type() {
+                        SemanticType::Input => zones.input_bg,
+                        SemanticType::Output => zones.output_bg,
+                        SemanticType::Prompt => zones.prompt_bg,
+                    };
+                    if let Some(tint) = tint {
+                        // For Input zones: shells implement backspace by
+                        // overwriting the deleted char with a space that
+                        // stays SemanticType::Input. Strip trailing blank
+                        // cells from the tinted rect so those erased
+                        // positions don't visually stay tinted.
+                        let tint_cells = if matches!(
+                            attrs.semantic_type(),
+                            SemanticType::Input
+                        ) {
+                            let trailing = cluster
+                                .text
+                                .chars()
+                                .rev()
+                                .take_while(|c| *c == ' ')
+                                .count();
+                            trimmed_trailing = trailing.min(cluster_width);
+                            cluster_width.saturating_sub(trimmed_trailing)
+                        } else {
+                            cluster_width
+                        };
+                        if tint_cells > 0 {
+                            bg = tint.to_linear();
+                            bg_default = false;
+                        }
+                    }
+                }
+
                 (
                     bg.mul_alpha(self.config.text_background_opacity),
                     bg_default,
+                    trimmed_trailing,
                 )
             };
 
@@ -235,10 +277,11 @@ impl crate::TermWindow {
                         phys(cluster.first_cell_idx, num_cols, direction) as f32 * cell_width
                     };
 
+                let trim_px = tint_trimmed_trailing as f32 * cell_width;
                 let mut width = if params.use_pixel_positioning {
-                    item.pixel_width
+                    (item.pixel_width - trim_px).max(0.0)
                 } else {
-                    cluster_width as f32 * cell_width
+                    (cluster_width.saturating_sub(tint_trimmed_trailing)) as f32 * cell_width
                 };
 
                 // If the tab bar is falling just short of the full width of the
@@ -788,6 +831,21 @@ impl crate::TermWindow {
                     if attrs.reverse() == !params.reverse_video {
                         std::mem::swap(&mut fg, &mut bg);
                         bg_default = false;
+                    }
+
+                    // Apply semantic-zone tint (OSC 133 Input/Output/Prompt regions).
+                    // Mirrors the cluster-loop path above; see comment there.
+                    if bg_default {
+                        let zones = &params.palette.semantic_zones;
+                        let tint = match attrs.semantic_type() {
+                            SemanticType::Input => zones.input_bg,
+                            SemanticType::Output => zones.output_bg,
+                            SemanticType::Prompt => zones.prompt_bg,
+                        };
+                        if let Some(tint) = tint {
+                            bg = tint.to_linear();
+                            bg_default = false;
+                        }
                     }
 
                     // Check for blink, and if this is the "not-visible"

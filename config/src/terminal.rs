@@ -63,7 +63,9 @@ impl wezterm_term::TerminalConfiguration for TermConfig {
         }
         let config = self.configuration();
 
-        config.resolved_palette.clone().into()
+        let mut palette: ColorPalette = config.resolved_palette.clone().into();
+        palette.semantic_zones = config.resolved_semantic_zones.clone().into();
+        palette
     }
 
     fn alternate_buffer_wheel_scroll_speed(&self) -> u8 {

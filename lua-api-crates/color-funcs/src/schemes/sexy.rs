@@ -53,6 +53,7 @@ impl Sexy {
                 wezterm_version: None,
                 aliases: vec![],
             },
+            ..Default::default()
         })
     }
 }

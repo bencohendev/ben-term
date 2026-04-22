@@ -139,6 +139,7 @@ impl ITerm2 {
                 wezterm_version: None,
                 aliases: vec![],
             },
+            ..Default::default()
         })
     }
 
