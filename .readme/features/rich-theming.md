@@ -1,6 +1,6 @@
 # Rich Theming
 
-**Status:** Active — milestone 1 (structured theme format + semantic-zone tinting) shipped. Future milestones listed under Scope are deferred.
+**Status:** Active — milestone 1 (structured theme format + semantic-zone tinting) shipped; milestone 4a (interactive theme builder — semantic zones) starting now.
 
 ## Overview
 
@@ -94,6 +94,58 @@ Shells without OSC 133 default every cell to `SemanticType::Output`. With `outpu
 - **Hot-reload required a one-line watcher extension.** The spec claimed reload would ride `config_was_reloaded()` "for free", but the existing file watcher only watched `wezterm.lua` and its parent dir (non-recursive), not the color-scheme search path. `ConfigInner::reload()` now also watches every dir returned by `Config::compute_color_scheme_dirs()`, so editing a `*.toml` palette or `[semantic_zones]` block updates the live window within ~200 ms.
 - **`screen_line.rs` has two tint sites**, not one: the cluster loop *and* the pixel-positioning path. Both must apply the tint or font-shaping variants (e.g. ligature-aware positioning) leave cells un-tinted.
 - **Input tint trims trailing blanks.** Shells implement backspace by overwriting the deleted character with a space that stays inside the 133;B region, so the cell remains `SemanticType::Input`. Without a trim the input tint would grow leftward-only and never visually shrink. The paint-site in `screen_line.rs` counts the contiguous trailing run of U+0020 in each Input cluster's text and narrows the tint rect by that many cells. Trim is scoped to Input; Prompt and Output zones paint full-cluster.
+
+## Milestone 4a — Interactive theme builder (semantic zones)
+
+Inline Modal UI to edit the active scheme's `[semantic_zones]` section. File-on-disk is the source of truth: every accepted edit writes the TOML, and the existing hot-reload path (milestone 1) paints the change within ~200 ms. No "Save" button, no in-memory dirty state.
+
+### Scope
+
+- **Entry point:** new `ActivateThemeBuilder` key assignment. Unbound by default — users bind it in `wezterm.lua`.
+- **Fields edited (4a):** `input_bg`, `output_bg`, `prompt_bg` only. The rest of the palette is 4b.
+- **Target file:** the on-disk TOML that defines the currently-active scheme. Built-in schemes (no file) show an "Export to make editable" row that dumps the resolved palette to `$XDG_CONFIG_HOME/wezterm/colors/<scheme>.toml` and then re-opens the builder against that new file.
+- **Non-goals for 4a:** RGB sliders, color-cube picker, creating fresh (non-exported) themes, renaming schemes, editing the 16-color ANSI palette.
+
+### Decisions
+
+| Decision | Choice | Why |
+|----------|--------|-----|
+| UI primitive | `Modal` trait (parallel to `PopupPicker`, no shared code) | Same upstream paint/input plumbing the palette + pickers use; zero risk of bleed-back into shared picker infra |
+| Source of truth | File on disk | Hot-reload already propagates file edits. Any in-memory mirror would drift; saving every edit keeps the contract trivial |
+| TOML writer | `toml_edit` | Preserves comments + key ordering. The vanilla `toml` crate round-trips lossily, which would silently eat the user's `# output_bg intentionally unset` kind of comments |
+| File-path resolution | Scan `compute_color_scheme_dirs()` twice: first for a `<name>.toml` filename match, then parse remaining TOMLs for `[metadata].name == <name>` | Mirrors how `load_color_schemes` accepts both conventions. Parse step only runs on name mismatch, so cost is bounded |
+| Built-in scheme case | Detect-via-no-path; offer export rather than silently creating a file | Surprise-write to the config dir would violate user expectation of "my settings are under my control" |
+| Input UX | Append-only hex text input (e.g. `#1a2b3c`), Enter commits, Escape cancels the field edit | Matches PopupPicker's PTY-echo append-only model so users get one input idiom across all overlays. Full cursor-editor behavior can come in 4b if needed |
+| Validation | Accept `#rgb` / `#rrggbb` (case-insensitive), reject otherwise | `ColorSchemeFile` TOML already accepts these; we round-trip to the same parser |
+| Unset a field | Submit empty string → remove the key from the TOML | Lets users blank a zone (graceful-fallback untinted behavior). Explicit "remove" clearer than a sentinel value |
+| Live preview | Rely on file-watcher hot-reload | Already works. Builder only writes; painting is someone else's job |
+| Swatch render | Small colored polygon inside each row | Users want to *see* the color next to the hex, not just read it |
+| Anchor | Center of the window (like the palette) | Not contextual to a cursor — this is a "settings" UI, not a command-completion popup |
+
+### Files to modify
+
+| File | Change |
+|------|--------|
+| `config/src/keyassignment.rs` | Add `ActivateThemeBuilder` variant |
+| `wezterm-gui/src/commands.rs` | Wire assignment in `derive_command_from_key_assignment`; no default binding |
+| `wezterm-gui/src/termwindow/mod.rs` | Dispatch `ActivateThemeBuilder` in `perform_key_assignment` → `theme_builder::try_activate` |
+| `wezterm-gui/src/overlay/mod.rs` | `pub mod theme_builder;` |
+| `wezterm-gui/src/overlay/theme_builder/mod.rs` | **New.** `try_activate` entry + helpers |
+| `wezterm-gui/src/overlay/theme_builder/builder.rs` | **New.** `ThemeBuilder` struct + `Modal` impl (render, key_down, mouse handlers) |
+| `wezterm-gui/src/overlay/theme_builder/file_ops.rs` | **New.** `resolve_active_scheme_path`, `write_zone_color`, `export_builtin` |
+| `config/Cargo.toml` or `wezterm-gui/Cargo.toml` | Add `toml_edit` dependency (put in whichever crate actually calls it — probably the gui crate for 4a, since only the builder writes) |
+
+### Verification (to be filled in after implementation)
+
+- [ ] `cargo build --release` passes
+- [ ] `cargo clippy --workspace -- -D warnings` clean on our modules
+- [ ] `cargo test --workspace` passes (add unit tests for `resolve_active_scheme_path` + `write_zone_color` TOML round-trip)
+- [ ] Bind `ActivateThemeBuilder` to a key, open against `/tmp/ben-term-theming-test/colors/zones-test.toml`
+- [ ] Edit `input_bg`, save → file updated, comments preserved, tint changes live within ~200 ms
+- [ ] Submit empty value for `output_bg` → key removed from TOML, untinted output zone
+- [ ] Invalid hex `#zzz` → rejected, field stays in edit mode
+- [ ] Against a built-in scheme → "Export" row appears; pick it → file created under config colors dir, builder re-opens editable
+- [ ] Escape from editing a field cancels the edit; Escape from row list closes the modal
 
 ## Manual test recipe
 
