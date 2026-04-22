@@ -1436,7 +1436,7 @@ impl Config {
         cfg
     }
 
-    fn compute_color_scheme_dirs(&self) -> Vec<PathBuf> {
+    pub fn compute_color_scheme_dirs(&self) -> Vec<PathBuf> {
         let mut paths = self.color_scheme_dirs.clone();
         for dir in CONFIG_DIRS.iter() {
             paths.push(dir.join("colors"));
