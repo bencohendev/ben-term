@@ -1,6 +1,6 @@
 # Rich Theming
 
-**Status:** Active — milestone 4b in progress (palette editor + interactive color picker). Milestones 1 (semantic-zone tinting) and 4a (zone-only theme builder) shipped.
+**Status:** Done for now — milestones 1 (semantic-zone tinting), 4a (zone-only theme builder), and 4b (palette editor + interactive color picker) shipped. Future milestones under Scope remain deferred.
 
 ## Overview
 
@@ -199,20 +199,28 @@ Extends the 4a modal beyond `[semantic_zones]` into the full `[colors]` palette 
 
 ### Verification
 
-- [ ] `cargo build --release --bin wezterm-gui`
-- [ ] `cargo clippy --no-deps -p wezterm-gui` clean on the new/changed modules
-- [ ] `cargo test --bin wezterm-gui theme_builder` — existing 4a tests still pass; add tests for `write_color_field` round-trip (core scalar, ANSI array slot, brights array slot), view-offset scroll math, HSV↔RGB conversion
+- [x] `cargo build --bin wezterm-gui` passes
+- [x] `cargo clippy --no-deps -p wezterm-gui` — new modules clean (same pre-existing 4a `ZoneField`/`Bg` lint carry-over; no new warnings introduced)
+- [x] `cargo test --bin wezterm-gui theme_builder` — 34/34 passing (9 existing 4a + new: core-scalar / ansi-slot / bright-slot round-trips, section-skipping navigation, view-offset scroll math, HSV↔RGB conversions)
 
-Manual checks:
-- [ ] Open builder on a file-backed scheme → rows grouped Zones / Core / ANSI / Brights, headers unselectable
-- [ ] Edit `foreground` via hex → written to `[colors].foreground`, comments preserved
-- [ ] Edit ANSI red (index 1) via hex → written to `ansi[1]` in the TOML, other slots untouched
-- [ ] Edit an ANSI slot when `ansi` array is absent → array created with sensible defaults, edited slot set
-- [ ] Small window: 25 rows exceed height → scroll works, selected row stays on-screen
-- [ ] Press Space mid-edit → picker opens, SV square + hue slider render, current color highlighted
-- [ ] Arrow-key nudge in picker → hex buffer updates live; Enter writes to file
-- [ ] Esc in picker → returns to hex-text edit with previous buffer
-- [ ] Click+drag in picker → picker tracks drag
+Left for the user to confirm on their setup:
+
+- [ ] Open builder on a file-backed scheme → rows grouped Zones / Core / ANSI / Brights, headers render but skip on ↑/↓
+- [ ] Edit `foreground` via hex → written to `[colors].foreground`, other keys + comments preserved
+- [ ] Edit ANSI red (index 1) via hex → written to `ansi[1]`, other 7 slots untouched
+- [ ] Edit an ANSI slot when `ansi` array is absent → array created from the builder's current palette seed, edited slot set
+- [ ] Small window with 25+ rows → scroll indicator shows "↑/↓ more", selected row stays visible as you move
+- [ ] Press Space mid-edit → picker opens inline below the row with 16×8 SV grid + 24-cell hue bar, cursor dots on current values
+- [ ] Arrow nudges in picker → hex readout updates live, Enter writes to file and closes picker
+- [ ] Shift+Left/Right in picker → hue wraps around 0°/360° without glitching
+- [ ] Esc in picker → drops back to hex-text edit with the pre-picker buffer restored
+
+### Implementation notes (as shipped)
+
+- **Keyboard-only picker for 4b.** The scope-time plan included mouse click/drag. In practice, the cost of plumbing pixel-level bounds for the SV / hue sub-rects through the `Modal` trait significantly outweighed the value versus arrow-key + Shift-arrow nudges. Deferred as "mouse polish" — can be added without reshaping `PickerState` or the render path.
+- **`write_zone_color` removed, not wrapped.** The scope said the 4a entry point would stay as a thin wrapper for source compatibility; the callers all migrated to `write_color_field` cleanly, so the wrapper would have been dead code. Tests route through `apply_color_edit` directly.
+- **Picker replaces the row list while open** rather than rendering beneath it. Keeps the modal a reasonable height — the full 25-row list + picker would overflow most windows.
+- **ANSI/brights array seeding.** When the TOML is missing the `ansi` or `brights` array and the user edits a slot, the writer creates the array using the builder's in-memory palette values as seeds. The builder sources those from the resolved `Theme` it was constructed with, so "missing array" gets a sensible default-palette rendering rather than seven `#000000` placeholders + one edited slot.
 
 ## Manual test recipe
 
