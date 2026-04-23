@@ -170,9 +170,9 @@ impl ThemeBuilder {
             ColorField::Zone(z) => {
                 let zones = self.zones.borrow();
                 match z {
-                    ZoneField::InputBg => zones.input_bg,
-                    ZoneField::OutputBg => zones.output_bg,
-                    ZoneField::PromptBg => zones.prompt_bg,
+                    ZoneField::Input => zones.input_bg,
+                    ZoneField::Output => zones.output_bg,
+                    ZoneField::Prompt => zones.prompt_bg,
                 }
             }
             ColorField::Core(c) => {
@@ -204,9 +204,9 @@ impl ThemeBuilder {
             ColorField::Zone(z) => {
                 let mut zones = self.zones.borrow_mut();
                 match z {
-                    ZoneField::InputBg => zones.input_bg = color,
-                    ZoneField::OutputBg => zones.output_bg = color,
-                    ZoneField::PromptBg => zones.prompt_bg = color,
+                    ZoneField::Input => zones.input_bg = color,
+                    ZoneField::Output => zones.output_bg = color,
+                    ZoneField::Prompt => zones.prompt_bg = color,
                 }
             }
             ColorField::Core(c) => {
@@ -1144,7 +1144,7 @@ mod tests {
         assert!(matches!(rows[0], RowKind::Section("Semantic zones")));
         assert!(matches!(
             rows[1],
-            RowKind::Field(ColorField::Zone(ZoneField::InputBg))
+            RowKind::Field(ColorField::Zone(ZoneField::Input))
         ));
     }
 
@@ -1197,7 +1197,7 @@ mod tests {
     fn begin_edit_seeds_with_current_zone_value() {
         let b = builder_with_rows(Some("/tmp/x.toml".into()));
         b.set_value(
-            ColorField::Zone(ZoneField::InputBg),
+            ColorField::Zone(ZoneField::Input),
             Some(RgbaColor::from((0x00u8, 0x44, 0xaa))),
         );
         b.begin_edit();
@@ -1266,7 +1266,7 @@ mod tests {
         std::fs::write(&path, "[semantic_zones]\ninput_bg = \"#112233\"\n").unwrap();
         let b = builder_with_rows(Some(path.clone()));
         b.set_value(
-            ColorField::Zone(ZoneField::InputBg),
+            ColorField::Zone(ZoneField::Input),
             Some(RgbaColor::from((0x11u8, 0x22, 0x33))),
         );
         b.begin_edit();
@@ -1274,7 +1274,7 @@ mod tests {
         b.commit_edit();
 
         assert!(b
-            .current_value(ColorField::Zone(ZoneField::InputBg))
+            .current_value(ColorField::Zone(ZoneField::Input))
             .is_none());
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(!saved.contains("input_bg"));
@@ -1319,7 +1319,7 @@ mod tests {
         assert!(b.editing.borrow().is_some());
         assert!(b.error.borrow().is_some());
         assert!(b
-            .current_value(ColorField::Zone(ZoneField::InputBg))
+            .current_value(ColorField::Zone(ZoneField::Input))
             .is_none());
     }
 

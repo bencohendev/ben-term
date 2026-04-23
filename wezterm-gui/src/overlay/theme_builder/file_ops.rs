@@ -62,30 +62,30 @@ pub fn resolve_scheme_file(scheme_name: &str, dirs: &[PathBuf]) -> Option<PathBu
 /// so a typo can't silently target the wrong key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZoneField {
-    InputBg,
-    OutputBg,
-    PromptBg,
+    Input,
+    Output,
+    Prompt,
 }
 
 impl ZoneField {
     pub fn key(self) -> &'static str {
         match self {
-            Self::InputBg => "input_bg",
-            Self::OutputBg => "output_bg",
-            Self::PromptBg => "prompt_bg",
+            Self::Input => "input_bg",
+            Self::Output => "output_bg",
+            Self::Prompt => "prompt_bg",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::InputBg => "Input background",
-            Self::OutputBg => "Output background",
-            Self::PromptBg => "Prompt background",
+            Self::Input => "Input background",
+            Self::Output => "Output background",
+            Self::Prompt => "Prompt background",
         }
     }
 
     pub fn all() -> [ZoneField; 3] {
-        [Self::InputBg, Self::OutputBg, Self::PromptBg]
+        [Self::Input, Self::Output, Self::Prompt]
     }
 }
 
@@ -377,7 +377,7 @@ mod tests {
         let input = r##"[colors]
 foreground = "#fff"
 "##;
-        let out = zone_roundtrip(input, ZoneField::InputBg, Some("#0044aa"));
+        let out = zone_roundtrip(input, ZoneField::Input, Some("#0044aa"));
         assert!(out.contains("[semantic_zones]"));
         assert!(out.contains("input_bg"));
         assert!(out.contains("#0044aa"));
@@ -393,7 +393,7 @@ foreground = "#fff" # main fg
 input_bg = "#111" # typed input
 # output_bg intentionally unset
 "##;
-        let out = zone_roundtrip(input, ZoneField::InputBg, Some("#222"));
+        let out = zone_roundtrip(input, ZoneField::Input, Some("#222"));
         assert!(out.contains("# main fg"));
         assert!(out.contains("# Zones section"));
         assert!(out.contains("# typed input") || out.contains("# output_bg intentionally unset"));
@@ -405,7 +405,7 @@ input_bg = "#111" # typed input
 input_bg = "#111"
 output_bg = "#222"
 "##;
-        let out = zone_roundtrip(input, ZoneField::InputBg, None);
+        let out = zone_roundtrip(input, ZoneField::Input, None);
         assert!(!out.contains("input_bg"));
         assert!(out.contains("output_bg"));
     }
@@ -418,7 +418,7 @@ foreground = "#fff"
 [semantic_zones]
 input_bg = "#111"
 "##;
-        let out = zone_roundtrip(input, ZoneField::InputBg, None);
+        let out = zone_roundtrip(input, ZoneField::Input, None);
         assert!(!out.contains("semantic_zones"));
         assert!(out.contains("foreground"));
     }
@@ -428,7 +428,7 @@ input_bg = "#111"
         let input = r##"[semantic_zones]
 input_bg = "#111"
 "##;
-        let out = zone_roundtrip(input, ZoneField::InputBg, Some("#222"));
+        let out = zone_roundtrip(input, ZoneField::Input, Some("#222"));
         assert!(out.contains(r##"input_bg = "#222""##));
         assert!(!out.contains("#111"));
     }
@@ -521,7 +521,7 @@ ansi = ["#000000","#111111","#222222","#333333","#444444","#555555","#666666","#
 
     #[test]
     fn allows_unset_matches_field_kind() {
-        assert!(ColorField::Zone(ZoneField::InputBg).allows_unset());
+        assert!(ColorField::Zone(ZoneField::Input).allows_unset());
         assert!(ColorField::Core(CoreField::Foreground).allows_unset());
         assert!(!ColorField::Ansi(0).allows_unset());
         assert!(!ColorField::Bright(0).allows_unset());
