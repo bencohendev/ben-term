@@ -1,12 +1,12 @@
 //! File-system plumbing for the theme builder: resolving the on-disk
 //! TOML that defines the active scheme, editing its `[semantic_zones]`
-//! section while preserving comments/ordering, and exporting a built-in
-//! scheme to disk so it becomes editable.
+//! and `[colors]` sections while preserving comments/ordering, and
+//! exporting a built-in scheme to disk so it becomes editable.
 
 use anyhow::{anyhow, Context, Result};
 use config::{ColorSchemeFile, Theme};
 use std::path::{Path, PathBuf};
-use toml_edit::{value, DocumentMut, Item, Table};
+use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 /// Map a scheme name to the on-disk TOML file that defines it, if any.
 ///
@@ -89,14 +89,111 @@ impl ZoneField {
     }
 }
 
-/// Set (or remove when `hex` is `None`) a `[semantic_zones]` field in the
-/// scheme's TOML file. Uses `toml_edit` so inline comments, key order, and
-/// whitespace are preserved across the edit.
+/// Scalar entries inside the `[colors]` table (everything except the
+/// `ansi`/`brights` arrays and `indexed` 256-color map, which are 4b+
+/// scope via other variants of `ColorField`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreField {
+    Foreground,
+    Background,
+    CursorBg,
+    CursorFg,
+    SelectionBg,
+    SelectionFg,
+}
+
+impl CoreField {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Foreground => "foreground",
+            Self::Background => "background",
+            Self::CursorBg => "cursor_bg",
+            Self::CursorFg => "cursor_fg",
+            Self::SelectionBg => "selection_bg",
+            Self::SelectionFg => "selection_fg",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Foreground => "Foreground",
+            Self::Background => "Background",
+            Self::CursorBg => "Cursor background",
+            Self::CursorFg => "Cursor foreground",
+            Self::SelectionBg => "Selection background",
+            Self::SelectionFg => "Selection foreground",
+        }
+    }
+
+    pub fn all() -> [CoreField; 6] {
+        [
+            Self::Foreground,
+            Self::Background,
+            Self::CursorBg,
+            Self::CursorFg,
+            Self::SelectionBg,
+            Self::SelectionFg,
+        ]
+    }
+}
+
+/// Which color the builder is editing. One enum for zones, core palette,
+/// and indexed ANSI/brights slots so the edit/write path is unified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorField {
+    Zone(ZoneField),
+    Core(CoreField),
+    /// Index 0..8 into `[colors].ansi`.
+    Ansi(u8),
+    /// Index 0..8 into `[colors].brights`.
+    Bright(u8),
+}
+
+/// Standard 8-color ANSI names. Used for row labels and nothing else.
+const ANSI_NAMES: [&str; 8] = [
+    "Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White",
+];
+
+impl ColorField {
+    pub fn label(self) -> String {
+        match self {
+            Self::Zone(z) => z.label().to_string(),
+            Self::Core(c) => c.label().to_string(),
+            Self::Ansi(i) => format!("ANSI {} ({})", i, ANSI_NAMES[i as usize % 8]),
+            Self::Bright(i) => format!("Bright {} ({})", i, ANSI_NAMES[i as usize % 8]),
+        }
+    }
+
+    /// Whether an empty-string commit should remove the value. Arrays can't
+    /// have individual slots unset, so only scalar fields qualify.
+    pub fn allows_unset(self) -> bool {
+        matches!(self, Self::Zone(_) | Self::Core(_))
+    }
+}
+
+/// Generalized TOML writer: set (or remove, when applicable) any
+/// `ColorField` in the on-disk scheme file. Uses `toml_edit` so inline
+/// comments, key order, and whitespace are preserved across the edit.
 ///
-/// Creates the `[semantic_zones]` table if absent. Removes an empty
-/// `[semantic_zones]` table to keep diffs clean when the user unsets the
-/// last zone color.
-pub fn write_zone_color(path: &Path, field: ZoneField, hex: Option<&str>) -> Result<()> {
+/// Behavior per field kind:
+/// - `Zone`: add/remove key in `[semantic_zones]`; delete the table if
+///   emptied.
+/// - `Core`: add/remove key in `[colors]`; leave the (possibly empty)
+///   `[colors]` table in place since it's the canonical palette container.
+/// - `Ansi(i)` / `Bright(i)`: replace slot `i` in `[colors].ansi` or
+///   `[colors].brights`. If the array is absent, it is created using
+///   `seed_array` (or `#000000` for missing entries as a last resort) so
+///   the resulting file remains a valid 8-color palette.
+///
+/// `seed_array` is only consulted when creating a missing `ansi`/`brights`
+/// array; callers typically pass the current in-memory palette values so
+/// other slots retain their previously-effective (default) colors.
+pub fn write_color_field(
+    path: &Path,
+    field: ColorField,
+    hex: Option<&str>,
+    seed_array: Option<&[String; 8]>,
+) -> Result<()> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading {}", path.display()))?;
 
@@ -104,7 +201,7 @@ pub fn write_zone_color(path: &Path, field: ZoneField, hex: Option<&str>) -> Res
         .parse()
         .with_context(|| format!("parsing TOML at {}", path.display()))?;
 
-    apply_zone_edit(&mut doc, field, hex);
+    apply_color_edit(&mut doc, field, hex, seed_array);
 
     let new_text = doc.to_string();
     std::fs::write(path, new_text)
@@ -114,6 +211,20 @@ pub fn write_zone_color(path: &Path, field: ZoneField, hex: Option<&str>) -> Res
 
 /// Pure TOML transform — extracted so tests can exercise it without
 /// touching the filesystem.
+fn apply_color_edit(
+    doc: &mut DocumentMut,
+    field: ColorField,
+    hex: Option<&str>,
+    seed_array: Option<&[String; 8]>,
+) {
+    match field {
+        ColorField::Zone(z) => apply_zone_edit(doc, z, hex),
+        ColorField::Core(c) => apply_core_edit(doc, c, hex),
+        ColorField::Ansi(idx) => apply_array_edit(doc, "ansi", idx, hex, seed_array),
+        ColorField::Bright(idx) => apply_array_edit(doc, "brights", idx, hex, seed_array),
+    }
+}
+
 fn apply_zone_edit(doc: &mut DocumentMut, field: ZoneField, hex: Option<&str>) {
     let key = field.key();
 
@@ -139,6 +250,70 @@ fn apply_zone_edit(doc: &mut DocumentMut, field: ZoneField, hex: Option<&str>) {
         // Clean up an emptied table to keep written files tidy.
         if table.iter().next().is_none() {
             doc.remove("semantic_zones");
+        }
+    }
+}
+
+fn apply_core_edit(doc: &mut DocumentMut, field: CoreField, hex: Option<&str>) {
+    let key = field.key();
+
+    let ensure_table = hex.is_some();
+    if ensure_table && !doc.contains_key("colors") {
+        let mut t = Table::new();
+        t.set_implicit(false);
+        doc["colors"] = Item::Table(t);
+    }
+
+    if let Some(table) = doc.get_mut("colors").and_then(Item::as_table_mut) {
+        match hex {
+            Some(h) => {
+                table[key] = value(h);
+            }
+            None => {
+                table.remove(key);
+            }
+        }
+    }
+}
+
+fn apply_array_edit(
+    doc: &mut DocumentMut,
+    array_key: &str,
+    idx: u8,
+    hex: Option<&str>,
+    seed_array: Option<&[String; 8]>,
+) {
+    // Individual slot-unset isn't meaningful for a fixed 8-element array.
+    let hex = match hex {
+        Some(h) => h,
+        None => return,
+    };
+
+    if !doc.contains_key("colors") {
+        let mut t = Table::new();
+        t.set_implicit(false);
+        doc["colors"] = Item::Table(t);
+    }
+
+    let colors = match doc.get_mut("colors").and_then(Item::as_table_mut) {
+        Some(t) => t,
+        None => return,
+    };
+
+    if !colors.contains_key(array_key) {
+        let mut arr = Array::new();
+        for slot in 0..8 {
+            let seed = seed_array
+                .and_then(|s| s.get(slot).map(String::as_str))
+                .unwrap_or("#000000");
+            arr.push(seed);
+        }
+        colors[array_key] = value(arr);
+    }
+
+    if let Some(arr) = colors.get_mut(array_key).and_then(Item::as_array_mut) {
+        if (idx as usize) < arr.len() {
+            arr.replace(idx as usize, hex);
         }
     }
 }
@@ -180,9 +355,20 @@ pub fn export_theme_to_file(path: &Path, theme: &Theme, scheme_name: &str) -> Re
 mod tests {
     use super::*;
 
-    fn roundtrip(input: &str, field: ZoneField, hex: Option<&str>) -> String {
+    fn zone_roundtrip(input: &str, field: ZoneField, hex: Option<&str>) -> String {
         let mut doc: DocumentMut = input.parse().unwrap();
-        apply_zone_edit(&mut doc, field, hex);
+        apply_color_edit(&mut doc, ColorField::Zone(field), hex, None);
+        doc.to_string()
+    }
+
+    fn field_roundtrip(
+        input: &str,
+        field: ColorField,
+        hex: Option<&str>,
+        seed: Option<&[String; 8]>,
+    ) -> String {
+        let mut doc: DocumentMut = input.parse().unwrap();
+        apply_color_edit(&mut doc, field, hex, seed);
         doc.to_string()
     }
 
@@ -191,7 +377,7 @@ mod tests {
         let input = r##"[colors]
 foreground = "#fff"
 "##;
-        let out = roundtrip(input, ZoneField::InputBg, Some("#0044aa"));
+        let out = zone_roundtrip(input, ZoneField::InputBg, Some("#0044aa"));
         assert!(out.contains("[semantic_zones]"));
         assert!(out.contains("input_bg"));
         assert!(out.contains("#0044aa"));
@@ -207,7 +393,7 @@ foreground = "#fff" # main fg
 input_bg = "#111" # typed input
 # output_bg intentionally unset
 "##;
-        let out = roundtrip(input, ZoneField::InputBg, Some("#222"));
+        let out = zone_roundtrip(input, ZoneField::InputBg, Some("#222"));
         assert!(out.contains("# main fg"));
         assert!(out.contains("# Zones section"));
         assert!(out.contains("# typed input") || out.contains("# output_bg intentionally unset"));
@@ -219,7 +405,7 @@ input_bg = "#111" # typed input
 input_bg = "#111"
 output_bg = "#222"
 "##;
-        let out = roundtrip(input, ZoneField::InputBg, None);
+        let out = zone_roundtrip(input, ZoneField::InputBg, None);
         assert!(!out.contains("input_bg"));
         assert!(out.contains("output_bg"));
     }
@@ -232,7 +418,7 @@ foreground = "#fff"
 [semantic_zones]
 input_bg = "#111"
 "##;
-        let out = roundtrip(input, ZoneField::InputBg, None);
+        let out = zone_roundtrip(input, ZoneField::InputBg, None);
         assert!(!out.contains("semantic_zones"));
         assert!(out.contains("foreground"));
     }
@@ -242,8 +428,102 @@ input_bg = "#111"
         let input = r##"[semantic_zones]
 input_bg = "#111"
 "##;
-        let out = roundtrip(input, ZoneField::InputBg, Some("#222"));
+        let out = zone_roundtrip(input, ZoneField::InputBg, Some("#222"));
         assert!(out.contains(r##"input_bg = "#222""##));
         assert!(!out.contains("#111"));
+    }
+
+    #[test]
+    fn core_edit_creates_colors_and_sets_key() {
+        let input = "";
+        let out = field_roundtrip(
+            input,
+            ColorField::Core(CoreField::Foreground),
+            Some("#abcdef"),
+            None,
+        );
+        assert!(out.contains("[colors]"));
+        assert!(out.contains(r##"foreground = "#abcdef""##));
+    }
+
+    #[test]
+    fn core_edit_removes_key_but_keeps_table() {
+        let input = r##"[colors]
+foreground = "#abcdef"
+background = "#111111"
+"##;
+        let out = field_roundtrip(input, ColorField::Core(CoreField::Foreground), None, None);
+        assert!(!out.contains("foreground"));
+        assert!(out.contains("[colors]"));
+        assert!(out.contains("background"));
+    }
+
+    #[test]
+    fn ansi_edit_creates_array_when_absent_with_seed() {
+        let input = r##"[colors]
+foreground = "#fff"
+"##;
+        let seed: [String; 8] = [
+            "#010101".into(),
+            "#020202".into(),
+            "#030303".into(),
+            "#040404".into(),
+            "#050505".into(),
+            "#060606".into(),
+            "#070707".into(),
+            "#080808".into(),
+        ];
+        let out = field_roundtrip(input, ColorField::Ansi(1), Some("#ff0000"), Some(&seed));
+        // Red (index 1) takes the commit value; other slots keep their seed.
+        assert!(out.contains("#ff0000"));
+        assert!(out.contains("#010101"));
+        assert!(out.contains("#080808"));
+        assert!(out.contains("ansi"));
+    }
+
+    #[test]
+    fn ansi_edit_replaces_existing_slot_only() {
+        let input = r##"[colors]
+ansi = ["#000000","#111111","#222222","#333333","#444444","#555555","#666666","#777777"]
+"##;
+        let out = field_roundtrip(input, ColorField::Ansi(2), Some("#abcdef"), None);
+        assert!(out.contains("#abcdef"));
+        assert!(!out.contains("#222222"));
+        // Surrounding slots untouched.
+        assert!(out.contains("#111111"));
+        assert!(out.contains("#333333"));
+    }
+
+    #[test]
+    fn bright_edit_targets_brights_array() {
+        let input = r##"[colors]
+ansi =    ["#000000","#111111","#222222","#333333","#444444","#555555","#666666","#777777"]
+brights = ["#888888","#999999","#aaaaaa","#bbbbbb","#cccccc","#dddddd","#eeeeee","#ffffff"]
+"##;
+        let out = field_roundtrip(input, ColorField::Bright(3), Some("#deadbe"), None);
+        assert!(out.contains("#deadbe"));
+        // The ansi slot at index 3 was "#333333" — still present.
+        assert!(out.contains("#333333"));
+        // The original brights slot at index 3 was "#bbbbbb" — removed.
+        assert!(!out.contains("#bbbbbb"));
+    }
+
+    #[test]
+    fn ansi_edit_ignores_none_hex() {
+        let input = r##"[colors]
+ansi = ["#000000","#111111","#222222","#333333","#444444","#555555","#666666","#777777"]
+"##;
+        let out = field_roundtrip(input, ColorField::Ansi(0), None, None);
+        // No-op: all slots intact.
+        assert!(out.contains("#000000"));
+        assert!(out.contains("#777777"));
+    }
+
+    #[test]
+    fn allows_unset_matches_field_kind() {
+        assert!(ColorField::Zone(ZoneField::InputBg).allows_unset());
+        assert!(ColorField::Core(CoreField::Foreground).allows_unset());
+        assert!(!ColorField::Ansi(0).allows_unset());
+        assert!(!ColorField::Bright(0).allows_unset());
     }
 }
