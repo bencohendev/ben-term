@@ -1,6 +1,6 @@
 # Rich Theming
 
-**Status:** Done for now — milestone 1 (structured theme format + semantic-zone tinting) and milestone 4a (interactive theme builder — semantic zones) shipped. Future milestones under Scope remain deferred.
+**Status:** Active — milestone 4b in progress (palette editor + interactive color picker). Milestones 1 (semantic-zone tinting) and 4a (zone-only theme builder) shipped.
 
 ## Overview
 
@@ -159,6 +159,60 @@ Left for the user to confirm on their setup:
 - **`toml_edit` for write-back, `toml` for export.** Edits to an existing file use `toml_edit::DocumentMut` to preserve comments and ordering. The export path (built-in → disk) reuses the existing `ColorSchemeFile::save_to_file` which emits a fresh, formatted file with no user comments to preserve — simpler and already tested.
 - **`[semantic_zones]` table is removed when emptied** so a user who unsets all three fields doesn't see a lingering empty section.
 - **`std::convert::TryFrom` import is required** in `builder.rs` because `wezterm-gui` is edition 2018. Future edition bump would make this redundant.
+
+## Milestone 4b — Palette editor + interactive color picker
+
+Extends the 4a modal beyond `[semantic_zones]` into the full `[colors]` palette (core + 16 ANSI) and replaces the hex-text-only input with an inline HSV color picker so users don't have to type hex for every tweak.
+
+### Scope
+
+- **Rows added (in order under the existing zone rows):**
+  - Core: `foreground`, `background`, `cursor_bg`, `cursor_fg`, `selection_bg`, `selection_fg`
+  - ANSI (8): black, red, green, yellow, blue, magenta, cyan, white
+  - Brights (8): same names, bright variants
+  - Static, non-selectable section headers between groups.
+- **Scroll:** the expanded row list will overflow a small window. Clamp visible rows to available height and scroll the selected row into view.
+- **Color picker:** Space on an editing row opens an inline HSV picker (saturation×value square + hue slider). Mouse click/drag and arrow keys update the color; the row's edit buffer live-updates to the current hex. Enter commits (writes TOML + exits picker + exits edit mode). Esc closes the picker, keeping the previous hex-text buffer.
+- **Non-goals for 4b:** fresh-theme creation, renaming, indexed (256-color) palette, tab-bar colors, `cursor_border`, `compose_cursor`, copy-mode/quick-select sub-palettes.
+
+### Decisions
+
+| Decision | Choice | Why |
+|----------|--------|-----|
+| Row organization | Flat linear list with static section headers | 4a is linear; collapsible sections add state/UI for marginal density win |
+| Scroll model | Clamp to available height, scroll selection into view | Mirrors existing PopupPicker viewport logic |
+| Picker color model | HSV (sat×val square + hue slider) | Standard color-picker ergonomics; HSV↔RGB mapping is trivial |
+| Picker render | Grid of solid-bg `Element` rects (24×16 SV + 24 hue cells) | Reuses the known-good box-model paint path; introducing a gradient primitive is real renderer work, defer unless the swatch grid looks bad |
+| Picker entry key | `Space` on an editing row | Unambiguous, easy to reach. `Tab` considered but less discoverable |
+| Picker commit | Enter → writes hex to file + closes picker + closes edit mode | Single commit path; Esc returns to hex-text without losing prior buffer |
+| TOML writer | Generalize `write_zone_color` → `write_color_field`, dispatching by field kind (top-level, `[colors]` scalar, `colors.ansi`/`colors.brights` array slot). `write_zone_color` stays as a thin wrapper for the zone sub-table | Factor field routing once; keep 4a tests and semantics intact |
+| Field identity | New `ColorField` enum covering `Zone(ZoneField)`, `Core(CoreField)`, `Ansi(u8)`, `Bright(u8)` — `RowKind` becomes `Field(ColorField)` + `Section(&'static str)` + `Export` | One enum means one write path, one edit path, no parallel branches to keep in sync |
+
+### Files to modify
+
+| File | Change |
+|------|--------|
+| `wezterm-gui/src/overlay/theme_builder/file_ops.rs` | Add `ColorField` enum + `CoreField` enum + `write_color_field`. `write_zone_color` becomes `write_color_field(ColorField::Zone(...))` wrapper. Round-trip tests for core scalars + `ansi[n]` + `brights[n]` |
+| `wezterm-gui/src/overlay/theme_builder/builder.rs` | Reshape `RowKind` to include sections + core/ANSI fields; add `view_offset` for scrolling; add picker sub-state (`editing: Option<EditState { buffer, picker: Option<PickerState> }>`); route Space-to-open-picker |
+| `wezterm-gui/src/overlay/theme_builder/picker.rs` | **New.** `ColorPicker` struct, HSV↔RGB math, render (swatch grid), keyboard + mouse handlers |
+| `wezterm-gui/src/overlay/theme_builder/mod.rs` | `pub mod picker;` |
+
+### Verification
+
+- [ ] `cargo build --release --bin wezterm-gui`
+- [ ] `cargo clippy --no-deps -p wezterm-gui` clean on the new/changed modules
+- [ ] `cargo test --bin wezterm-gui theme_builder` — existing 4a tests still pass; add tests for `write_color_field` round-trip (core scalar, ANSI array slot, brights array slot), view-offset scroll math, HSV↔RGB conversion
+
+Manual checks:
+- [ ] Open builder on a file-backed scheme → rows grouped Zones / Core / ANSI / Brights, headers unselectable
+- [ ] Edit `foreground` via hex → written to `[colors].foreground`, comments preserved
+- [ ] Edit ANSI red (index 1) via hex → written to `ansi[1]` in the TOML, other slots untouched
+- [ ] Edit an ANSI slot when `ansi` array is absent → array created with sensible defaults, edited slot set
+- [ ] Small window: 25 rows exceed height → scroll works, selected row stays on-screen
+- [ ] Press Space mid-edit → picker opens, SV square + hue slider render, current color highlighted
+- [ ] Arrow-key nudge in picker → hex buffer updates live; Enter writes to file
+- [ ] Esc in picker → returns to hex-text edit with previous buffer
+- [ ] Click+drag in picker → picker tracks drag
 
 ## Manual test recipe
 
