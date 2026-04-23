@@ -1,12 +1,13 @@
-//! Interactive theme builder (rich theming milestone 4a).
+//! Interactive theme builder (rich theming milestones 4a + 4b).
 //!
 //! Entry point invoked by the `ActivateThemeBuilder` key assignment.
 //! The modal itself lives in `builder.rs`; file-system plumbing for
 //! resolving the active scheme's on-disk TOML + writing zone edits
-//! lives in `file_ops.rs`.
+//! lives in `file_ops.rs`. The inline HSV color picker is `picker.rs`.
 
 pub mod builder;
 pub mod file_ops;
+pub mod picker;
 
 use crate::termwindow::TermWindow;
 use std::rc::Rc;
