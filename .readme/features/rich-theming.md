@@ -1,6 +1,6 @@
 # Rich Theming
 
-**Status:** Done for now — milestones 1 (semantic-zone tinting), 4a (zone-only theme builder), and 4b (palette editor + interactive color picker) shipped. Future milestones under Scope remain deferred.
+**Status:** Active — milestones 1 (semantic-zone tinting), 4a (zone-only theme builder), and 4b (palette editor + interactive color picker) shipped. Milestone 2 (error-zone tinting) in progress. Other future milestones under Scope remain deferred.
 
 ## Overview
 
@@ -221,6 +221,65 @@ Left for the user to confirm on their setup:
 - **`write_zone_color` removed, not wrapped.** The scope said the 4a entry point would stay as a thin wrapper for source compatibility; the callers all migrated to `write_color_field` cleanly, so the wrapper would have been dead code. Tests route through `apply_color_edit` directly.
 - **Picker replaces the row list while open** rather than rendering beneath it. Keeps the modal a reasonable height — the full 25-row list + picker would overflow most windows.
 - **ANSI/brights array seeding.** When the TOML is missing the `ansi` or `brights` array and the user edits a slot, the writer creates the array using the builder's in-memory palette values as seeds. The builder sources those from the resolved `Theme` it was constructed with, so "missing array" gets a sensible default-palette rendering rather than seven `#000000` placeholders + one edited slot.
+
+## Milestone 2 — Error-zone tinting
+
+Extends semantic-zone tinting so Output cells that belong to a command which exited non-zero (surfaced via OSC 133;D) paint with a configurable `error_bg` instead of the base `output_bg`. Rides the existing paint path (milestone 1) and the existing theme-builder plumbing (4a/4b).
+
+### Scope
+
+- New `error_bg` field on `SemanticZoneColors` (term mirror + config mirror + TOML `[semantic_zones]`).
+- OSC 133;D currently parsed + discarded. Add tracking: remember the visible row where OSC 133;C (start-of-output) fired; on 133;D with non-zero status, mark every `Line` from the command's start row through the current row as "failed command."
+- `screen_line.rs`: when the current line is marked failed and the cluster's semantic type is `Output`, prefer `error_bg` over `output_bg`. Success commands and zero-status Output keep painting `output_bg`.
+- Theme builder: add a fourth zone row (`Error output (error_bg)`), keyed `"error_bg"` in the TOML. Reuses 4a/4b file-ops + row rendering.
+
+**Non-goals**
+- Rendering the exit code itself (text, gutter marker). Separate feature.
+- Tinting Input/Prompt cells of failed commands — only Output.
+- Per-command collapse / command-block UI.
+- Styling based on signal termination, time-to-run, or any state beyond "exit code was non-zero."
+
+### Decisions
+
+| Decision | Choice | Why |
+|----------|--------|-----|
+| Where failed-command state lives | A new `IS_COMMAND_FAILED` flag on `LineBits` | `LineBits` has room (9 of 16 bits used); a bool flag is zero marginal memory, vs. ~8 bytes per line for `Option<i32>`. Tinting only needs yes/no. Exit-code display would be a separate future feature with its own storage |
+| Start-of-command marker | `command_start_stable_row: Option<StableRowIndex>` on `TerminalState`, set in the OSC 133;C handler | Stable row index is scroll-safe. Scrollback may push the row out of the visible range before 133;D arrives; stable index survives that |
+| When to stamp | On OSC 133;D with non-zero status, walk stable rows `[start..=current]`, convert to phys, set the flag on each `Line` | Exit code arrives after output is already emitted. Walk is bounded by one command's output (typically a screen or two). Skip when no `command_start_stable_row` is set (shell without 133;C) |
+| Zero status | Do nothing — leave flag clear | Successful commands are the overwhelming default; tinting all of them would be noise |
+| Paint | `screen_line.rs` existing cluster + pixel-positioning tint sites | Both sites get the same guard: if cluster is `Output` and `params.line.is_command_failed()`, return `zones.error_bg.or(zones.output_bg)` |
+| Fallback when `error_bg` unset | Same as existing zone behavior: no tint change | Respects user intent — users who don't set `error_bg` stay on `output_bg` |
+| Theme builder row placement | Immediately after `Output (output_bg)` in the Zones section | Keeps related fields adjacent; no effect on other rows |
+
+### Files to modify
+
+| File | Change |
+|------|--------|
+| `wezterm-surface/src/line/linebits.rs` | Add `IS_COMMAND_FAILED = 1<<9` |
+| `wezterm-surface/src/line/line.rs` | Add `is_command_failed()` getter + `set_command_failed(bool)` setter on `Line` |
+| `term/src/terminalstate.rs` (or wherever `TerminalState` is declared) | Add `command_start_stable_row: Option<StableRowIndex>` field + default |
+| `term/src/terminalstate/performer.rs` | Set start row in the `MarkEndOfInputAndStartOfOutput` (OSC 133;C) arm; stamp failed flag on the row range in the `CommandStatus` (OSC 133;D) arm |
+| `term/src/color.rs` | Add `error_bg: Option<SrgbaTuple>` to `SemanticZoneColors` |
+| `config/src/color.rs` | Add mirror `error_bg: Option<RgbaColor>` + `From` conversions + round-trip test |
+| `wezterm-gui/src/termwindow/render/screen_line.rs` | At both tint sites, if cluster is `Output` and `params.line.is_command_failed()` and `error_bg.is_some()`, use `error_bg` |
+| `wezterm-gui/src/overlay/theme_builder/file_ops.rs` | Add `ZoneField::Error` variant (key `"error_bg"`, label text) |
+| `wezterm-gui/src/overlay/theme_builder/builder.rs` | Include Error row in the zone section |
+
+### Verification
+
+- [ ] `cargo build --release` passes
+- [ ] `cargo build --bin wezterm-gui` passes
+- [ ] `cargo clippy --no-deps -p wezterm-gui` clean on new code (same upstream-lint carve-out as 4a/4b)
+- [ ] `cargo test --workspace` — new tests: LineBits flag set/clear round-trip, theme-builder TOML round-trip with `error_bg`, performer flag-stamping on 133;D (unit if feasible)
+
+Left for the user to confirm on their setup:
+
+- [ ] Set `error_bg` in `zones-test.toml` (e.g. `error_bg = "#3a1f1f"`)
+- [ ] Run a successful command (`true` / `ls`) → output untinted or `output_bg` only
+- [ ] Run a failing command (`false` / `ls /does-not-exist`) → the command's output cells paint `error_bg`
+- [ ] Scrollback preserves the tint — scroll back up to a prior failed command, still red
+- [ ] Theme builder shows the new `Error output` row; editing it writes `error_bg` to TOML and re-paints live
+- [ ] Shell without OSC 133;D (or with broken integration) — no tinting regression on Output; `output_bg` still works
 
 ## Manual test recipe
 
