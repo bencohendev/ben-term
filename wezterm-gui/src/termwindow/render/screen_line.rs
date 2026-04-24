@@ -231,6 +231,15 @@ impl crate::TermWindow {
                     let zones = &params.palette.semantic_zones;
                     let tint = match attrs.semantic_type() {
                         SemanticType::Input => zones.input_bg,
+                        // Output cells on a line stamped IS_COMMAND_FAILED
+                        // (OSC 133;D with non-zero status) prefer `error_bg`
+                        // when it's set; otherwise fall through to `output_bg`.
+                        SemanticType::Output
+                            if params.line.is_command_failed()
+                                && zones.error_bg.is_some() =>
+                        {
+                            zones.error_bg
+                        }
                         SemanticType::Output => zones.output_bg,
                         SemanticType::Prompt => zones.prompt_bg,
                     };
@@ -839,6 +848,12 @@ impl crate::TermWindow {
                         let zones = &params.palette.semantic_zones;
                         let tint = match attrs.semantic_type() {
                             SemanticType::Input => zones.input_bg,
+                            SemanticType::Output
+                                if params.line.is_command_failed()
+                                    && zones.error_bg.is_some() =>
+                            {
+                                zones.error_bg
+                            }
                             SemanticType::Output => zones.output_bg,
                             SemanticType::Prompt => zones.prompt_bg,
                         };

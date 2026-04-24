@@ -173,6 +173,7 @@ impl ThemeBuilder {
                     ZoneField::Input => zones.input_bg,
                     ZoneField::Output => zones.output_bg,
                     ZoneField::Prompt => zones.prompt_bg,
+                    ZoneField::Error => zones.error_bg,
                 }
             }
             ColorField::Core(c) => {
@@ -207,6 +208,7 @@ impl ThemeBuilder {
                     ZoneField::Input => zones.input_bg = color,
                     ZoneField::Output => zones.output_bg = color,
                     ZoneField::Prompt => zones.prompt_bg = color,
+                    ZoneField::Error => zones.error_bg = color,
                 }
             }
             ColorField::Core(c) => {
@@ -1139,8 +1141,8 @@ mod tests {
     fn rows_for_file_backed_scheme_contain_all_sections() {
         let b = builder_with_rows(Some("/tmp/x.toml".into()));
         let rows = b.rows();
-        // 4 sections + 3 zones + 6 core + 8 ansi + 8 bright = 29 rows
-        assert_eq!(rows.len(), 29);
+        // 4 sections + 4 zones + 6 core + 8 ansi + 8 bright = 30 rows
+        assert_eq!(rows.len(), 30);
         assert!(matches!(rows[0], RowKind::Section("Semantic zones")));
         assert!(matches!(
             rows[1],
@@ -1164,6 +1166,9 @@ mod tests {
     #[test]
     fn move_down_skips_section_headers() {
         let b = builder_with_rows(Some("/tmp/x.toml".into()));
+        // Zones: Input (starts here), Output, Prompt, Error — then section
+        // header "Core palette" should be skipped onto Foreground.
+        b.move_down();
         b.move_down();
         b.move_down();
         b.move_down();
