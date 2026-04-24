@@ -1,6 +1,6 @@
 # Rich Theming
 
-**Status:** Done for now — milestones 1 (semantic-zone tinting), 2 (error-zone tinting), 4a (zone-only theme builder), and 4b (palette editor + interactive color picker) shipped. Other future milestones under Scope remain deferred.
+**Status:** Active — milestones 1 (semantic-zone tinting), 2 (error-zone tinting), 4a (zone-only theme builder), and 4b (palette editor + interactive color picker) shipped. Milestone 5 (live preview pane) is the current work. Other future milestones under Scope remain deferred.
 
 ## Overview
 
@@ -287,6 +287,89 @@ Confirmed on the user's setup:
 - **Walk range is inclusive on both ends and clamped via `stable_row_to_phys`.** If the start row has already scrolled out of the phys-row buffer, `stable_row_to_phys` returns `None` and the walk silently skips that row rather than stamping a bogus index — the same pattern the zone iterator uses elsewhere.
 - **Paint site is guarded by `error_bg.is_some()` before the fallthrough.** This matters: if a user only sets `error_bg` (no `output_bg`), failed-command cells should tint red while successful cells stay untinted. The `Output if ... && zones.error_bg.is_some() => zones.error_bg` pattern preserves the "unset zone = no tint" contract from milestone 1.
 - **One builder test needed the row-count bump.** `rows_for_file_backed_scheme_contain_all_sections` hard-codes the total row count (was 29, now 30) and `move_down_skips_section_headers` needed one more `move_down()` to cross the new Error field to reach Foreground. Both are mechanical updates; no behavior change.
+
+## Milestone 5 — Live preview pane
+
+Adds a miniature "sample terminal" pane alongside the theme builder's row list and HSV picker. Every themed surface (prompt / input / output / error, selection, cursor, foreground/background, ANSI + brights) is rendered inside the pane using the builder's **in-memory** palette + zones, with the currently-edited field overridden by the picker's live value. Users drag the hue slider or SV cursor and see the sample repaint instantly — no file write, no hot-reload round-trip.
+
+### Motivation
+
+Today's edit loop is: open picker → nudge color → press Enter → TOML writes → hot-reload fires ~200 ms later → the real terminal repaints. During the nudge itself the user sees only the hex readout change, not the color effect. For ANSI slot edits or zone edits this makes picking by eye almost impossible — you commit a guess, observe, re-open the picker, nudge again.
+
+The preview pane collapses the loop to zero latency for a scripted scene that exercises every slot.
+
+### Scope
+
+- **Preview pane** rendered inside the `ThemeBuilder` modal, right of the row list (or right of the picker while the picker is open).
+- **Sample content** — a static scripted transcript, not a live PTY. Exercises:
+  - Prompt line (tints `prompt_bg`, uses `foreground` on `background`)
+  - Typed input on the prompt (tints `input_bg`)
+  - Successful command output (tints `output_bg`)
+  - Failed command output (tints `error_bg`)
+  - Selected text range (uses `selection_bg` / `selection_fg`)
+  - Cursor cell on the input line (uses `cursor_bg` / `cursor_fg`)
+  - ANSI + brights swatch strip (16 cells, labeled 0–15)
+- **Live override** — while a field is being edited (text buffer or picker open), the pane renders with the candidate hex applied *in place of* the committed value for that field only. Every other field reads from the committed in-memory `palette` / `zones`.
+- **Applies to every field kind** — zones, core, ANSI, brights. Picker nudges on any row update the pane on the next frame.
+
+**Non-goals**
+- Applying the mid-edit candidate to the **real** terminal window (i.e. live-tinting the user's actual scrollback before Enter). Doable but larger — requires a palette-override path through `TermConfig::color_palette()` and cache invalidation on every nudge. Deferred as "milestone 5 stretch" unless the scripted preview proves insufficient.
+- Mirroring the user's real scrollback through the candidate palette in the preview pane (as opposed to a scripted scene). Same blocker as above plus cell-copying; the scripted scene gives full coverage with far less plumbing.
+- Theming the preview pane itself beyond the candidate colors (no chrome color customization, no multi-scene switcher).
+- Animating transitions between colors.
+
+### Decisions
+
+| Decision | Choice | Why |
+|----------|--------|-----|
+| Preview source | Scripted sample rendered via the existing modal `Element` box model | Reuses the box/cell paint the modal already uses for rows + picker swatches. Zero new renderer code. Guarantees every themed slot is exercised regardless of the user's actual session |
+| Live-candidate plumbing | `ThemeBuilder::preview_colors() -> (Palette, SemanticZoneColors)` returning committed state with the in-edit field overridden from `editing`/`picker` buffers | Single read path the preview call site hits on every `compute()`. No extra state, no cache to invalidate |
+| Invalid in-edit hex | Preview falls back to the committed color for that field | "Typing" should not flash arbitrary garbage — only valid hex (once a full `#rrggbb` parses) flows through. Matches how the picker itself treats intermediate states |
+| Layout — picker closed | Row list on the left, preview on the right, fixed-width preview (~32 cells) | Keeps rows prominent (the primary interaction) while showing ambient effect |
+| Layout — picker open | Picker on the left (replaces rows as 4b already does), preview on the right | Preview stays visible exactly when it matters most — during picker manipulation |
+| Small-window behavior | If modal width < threshold (roughly "preview doesn't fit"), hide the preview and keep the existing single-column layout | 4b already scrolls rows in a small window; reintroducing overflow from a side pane would churn the row scroll math |
+| ANSI / brights exercise | Single horizontal strip of 16 labeled cells at the bottom of the preview | Compact, deterministic; covers both arrays without needing a `ls --color` fake |
+| Failed-command sample | A bash-style `$ cat missing.txt` + `cat: missing.txt: No such file` on the next line, with the output line tinted via `error_bg` | Makes the error tint visible even when OSC 133;D is never fired — the preview fakes the failed-flag directly |
+| Cursor sample | Render a block cursor over a single input cell using `cursor_bg` / `cursor_fg` | `cursor_border` and blink modes are out of scope; a static block covers the common case |
+| Selection sample | Render a 6-cell selected range inside the output line, using `selection_bg` / `selection_fg` | One obvious visual; avoids a full selection-mode simulation |
+| Repaint trigger | Existing modal `compute()` already rebuilds the element tree on every key / mouse event. Preview rides that — no extra invalidation needed | Picker nudges already invalidate the tree |
+
+### Files to modify
+
+| File | Change |
+|------|--------|
+| `wezterm-gui/src/overlay/theme_builder/builder.rs` | Add `preview_colors()` helper returning `(Palette, SemanticZoneColors)` with the current edit overlay applied. Adjust `compute()` to emit a two-column outer box: left = existing row/picker column, right = preview column. Threshold check hides the preview column on narrow modal widths |
+| `wezterm-gui/src/overlay/theme_builder/preview.rs` | **New.** `render_preview(palette, zones, metrics, width_cells) -> Element` that builds the scripted scene (prompt / input / output / error / selection / cursor / ANSI strip) as nested `Element` rows |
+| `wezterm-gui/src/overlay/theme_builder/mod.rs` | `pub mod preview;` |
+| `wezterm-gui/src/overlay/theme_builder/picker.rs` | Minor: picker's `compute()` unchanged, but the *caller* in `builder.rs` now places the picker in the left column instead of full-width |
+
+No changes to `file_ops.rs`, no changes outside `theme_builder/`.
+
+### Verification
+
+- [ ] `cargo build --bin wezterm-gui` passes
+- [ ] `cargo clippy --no-deps -p wezterm-gui` — new preview module clean (same 4a/4b carry-over carve-out)
+- [ ] `cargo test --bin wezterm-gui theme_builder` — existing 36 tests still pass, plus new tests for `preview_colors()` override logic: committed-only when not editing, edit buffer overrides the edited field when valid, falls back to committed when buffer is partial/invalid
+
+Left for the user to confirm on their setup:
+
+- [ ] Open builder on a file-backed scheme → preview pane appears right of the row list showing prompt / input / output / error / selection / cursor / ANSI strip painted with the active scheme's colors
+- [ ] Select the `foreground` row, press Space → picker opens in the left column, preview stays visible on the right
+- [ ] Nudge hue in the picker → preview's prompt/output/input **text** repaints every arrow keystroke (no file write, no ~200 ms lag)
+- [ ] Select an ANSI slot (e.g. `ansi.red`, index 1) → picker opens, nudging repaints the slot's swatch in the ANSI strip instantly
+- [ ] Select the `error_bg` zone row → preview's failed-command line repaints on each picker nudge
+- [ ] Select `selection_bg` → the preview's selected range updates as you nudge
+- [ ] Type a partial hex (e.g. `#1a`) into a row (no picker) → preview keeps the committed color for that field (no flicker); on a full valid `#1a2b3c` the preview updates
+- [ ] Press Enter to commit → TOML written, preview re-seeds from the new committed state (no visible jump since it already matched the candidate)
+- [ ] Press Esc from picker → preview reverts to committed color for that field
+- [ ] Shrink the window width until the preview pane hides → single-column layout matches the pre-milestone-5 behavior; grow it back → preview returns
+- [ ] Against a built-in scheme (pre-Export) → preview renders with the resolved built-in palette; after Export, preview continues seamlessly
+
+### Open questions
+
+- **Preview width** — 32 cells is a guess. Needs a pass after first render to confirm the ANSI strip (16 cells + labels) and the scripted lines all fit without awkward wrapping. If 32 is tight, pick a number that lets the longest sample line (`cat: missing.txt: No such file`) fit on one row.
+- **Cursor on the prompt line** — if the prompt line also tints `prompt_bg`, the cursor cell will stack `prompt_bg` underneath `cursor_bg`. Confirm this matches real-terminal rendering (i.e. `cursor_bg` wins) or paints something unexpected.
+- **Stretch: live-tint the real window** — if after shipping the scripted pane users still reach for "I want to see my actual scrollback in this theme," revisit the deferred `TermConfig::color_palette()` override path. The two features are independent and can ship in that order.
 
 ## Manual test recipe
 
