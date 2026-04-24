@@ -24,6 +24,7 @@ use super::file_ops::{
     CoreField, ZoneField,
 };
 use super::picker::{render_picker, PickerState};
+use super::preview;
 use crate::termwindow::box_model::{
     BorderColor, BoxDimension, ComputedElement, Corners, DisplayType, Element, ElementColors,
     ElementContent, InheritableColor, LayoutContext, SizedPoly,
@@ -263,6 +264,36 @@ impl ThemeBuilder {
         Some(out)
     }
 
+    /// Palette + zones the live preview should paint with: committed
+    /// in-memory state with the current edit buffer overlaid onto exactly
+    /// the field being edited, iff the buffer parses as a valid color.
+    /// Partial / invalid buffers silently fall back to committed so the
+    /// preview never flashes garbage mid-type.
+    fn preview_colors(&self) -> (Palette, SemanticZoneColors) {
+        let mut palette = self.palette.borrow().clone();
+        let mut zones = self.zones.borrow().clone();
+
+        let buf = match self.editing.borrow().clone() {
+            Some(b) => b,
+            None => return (palette, zones),
+        };
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            return (palette, zones);
+        }
+        let color = match RgbaColor::try_from(trimmed.to_string()) {
+            Ok(c) => c,
+            Err(_) => return (palette, zones),
+        };
+
+        let rows = self.rows();
+        let idx = *self.selected_row.borrow();
+        if let Some(RowKind::Field(field)) = rows.get(idx).copied() {
+            apply_field_override(&mut palette, &mut zones, field, color);
+        }
+        (palette, zones)
+    }
+
     fn move_up(&self) {
         let rows = self.rows();
         let cur = *self.selected_row.borrow();
@@ -488,6 +519,47 @@ impl ThemeBuilder {
     }
 }
 
+/// Apply a single-color edit on top of a palette+zones snapshot. Mirrors
+/// the arms in `ThemeBuilder::set_value` but operates on owned state so
+/// the preview can overlay without mutating committed buffers.
+fn apply_field_override(
+    palette: &mut Palette,
+    zones: &mut SemanticZoneColors,
+    field: ColorField,
+    color: RgbaColor,
+) {
+    match field {
+        ColorField::Zone(z) => match z {
+            ZoneField::Input => zones.input_bg = Some(color),
+            ZoneField::Output => zones.output_bg = Some(color),
+            ZoneField::Prompt => zones.prompt_bg = Some(color),
+            ZoneField::Error => zones.error_bg = Some(color),
+        },
+        ColorField::Core(c) => match c {
+            CoreField::Foreground => palette.foreground = Some(color),
+            CoreField::Background => palette.background = Some(color),
+            CoreField::CursorBg => palette.cursor_bg = Some(color),
+            CoreField::CursorFg => palette.cursor_fg = Some(color),
+            CoreField::SelectionBg => palette.selection_bg = Some(color),
+            CoreField::SelectionFg => palette.selection_fg = Some(color),
+        },
+        ColorField::Ansi(i) => {
+            let mut arr = palette.ansi.unwrap_or([RgbaColor::default(); 8]);
+            if (i as usize) < arr.len() {
+                arr[i as usize] = color;
+            }
+            palette.ansi = Some(arr);
+        }
+        ColorField::Bright(i) => {
+            let mut arr = palette.brights.unwrap_or([RgbaColor::default(); 8]);
+            if (i as usize) < arr.len() {
+                arr[i as usize] = color;
+            }
+            palette.brights = Some(arr);
+        }
+    }
+}
+
 fn initial_selected_row(file_backed: bool) -> usize {
     if file_backed {
         // Row 0 is "Semantic zones" section header; first field is row 1.
@@ -610,9 +682,10 @@ fn finalize_modal(
     cell_h: f32,
     size: wezterm_term::TerminalSize,
     dimensions: crate::Dimensions,
+    desired_width_cells: usize,
 ) -> anyhow::Result<Vec<ComputedElement>> {
     let avail_pixel_width = size.cols as f32 * cell_w;
-    let desired_width_cells = 60_usize.min(size.cols.max(1));
+    let desired_width_cells = desired_width_cells.min(size.cols.max(1));
     let desired_pixel_width = desired_width_cells as f32 * cell_w;
 
     let element = Element::new(font, ElementContent::Children(elements))
@@ -752,38 +825,33 @@ impl ThemeBuilder {
         let picker_state = self.picker.borrow().clone();
         let rows_def = self.rows();
 
-        let mut elements: Vec<Element> = Vec::new();
+        // Title.
+        let title_element = Element::new(
+            &font,
+            ElementContent::Text(format!("Theme builder — {}", self.scheme_name)),
+        )
+        .colors(ElementColors {
+            border: BorderColor::default(),
+            bg: LinearRgba::TRANSPARENT.into(),
+            text: solid_fg_color.clone(),
+        })
+        .padding(BoxDimension {
+            left: Dimension::Cells(0.25),
+            right: Dimension::Cells(0.25),
+            top: Dimension::Cells(0.),
+            bottom: Dimension::Cells(0.5),
+        })
+        .display(DisplayType::Block);
 
-        // Title row.
-        elements.push(
-            Element::new(
-                &font,
-                ElementContent::Text(format!("Theme builder — {}", self.scheme_name)),
-            )
-            .colors(ElementColors {
-                border: BorderColor::default(),
-                bg: LinearRgba::TRANSPARENT.into(),
-                text: solid_fg_color.clone(),
-            })
-            .padding(BoxDimension {
-                left: Dimension::Cells(0.25),
-                right: Dimension::Cells(0.25),
-                top: Dimension::Cells(0.),
-                bottom: Dimension::Cells(0.5),
-            })
-            .display(DisplayType::Block),
-        );
-
-        // Picker mode: render only the editing row + picker, skip the
-        // full row list. Keeps the modal from becoming unreasonably tall
-        // when the palette is long (25+ rows + 10 picker rows > typical
-        // viewport).
+        // Body: picker mode shows only the editing row + picker; normal
+        // mode shows the scrolled row list with scroll indicators.
+        let mut body_elements: Vec<Element> = Vec::new();
         if let Some(state) = picker_state.as_ref() {
             if let Some(RowKind::Field(field)) = rows_def.get(selected).copied() {
                 let current = self.current_value(field);
                 let swatch = current.map(|c| c.deref().to_linear());
                 let value_text = format!("{}_", editing_buf.as_deref().unwrap_or(""));
-                elements.push(render_row(
+                body_elements.push(render_row(
                     &font,
                     field.label(),
                     value_text,
@@ -793,108 +861,77 @@ impl ThemeBuilder {
                     &solid_fg_color,
                 ));
             }
-            elements.push(render_picker(state, &font, &solid_fg_color));
+            body_elements.push(render_picker(state, &font, &solid_fg_color));
+        } else {
+            if top_row > 0 {
+                body_elements.push(render_scroll_indicator(
+                    &font,
+                    "↑ more above",
+                    &solid_fg_color,
+                ));
+            }
+            for (idx, row) in rows_def.iter().enumerate().skip(top_row).take(max_rows) {
+                let is_selected = idx == selected;
+                match *row {
+                    RowKind::Section(label) => {
+                        body_elements.push(render_section(&font, label, &solid_fg_color));
+                    }
+                    RowKind::Field(field) => {
+                        let is_editing = is_selected && editing_buf.is_some();
+                        let current = self.current_value(field);
+                        let swatch = current.map(|c| c.deref().to_linear());
 
-            let footer = "↑↓←→ pick  Shift+←/→ hue  ↵ save  Esc back".to_string();
-            elements.push(
-                Element::new(&font, ElementContent::Text(footer))
-                    .colors(ElementColors {
-                        border: BorderColor::default(),
-                        bg: LinearRgba::TRANSPARENT.into(),
-                        text: solid_fg_color.clone(),
-                    })
-                    .padding(BoxDimension {
-                        left: Dimension::Cells(0.25),
-                        right: Dimension::Cells(0.25),
-                        top: Dimension::Cells(0.5),
-                        bottom: Dimension::Cells(0.),
-                    })
-                    .display(DisplayType::Block),
-            );
+                        let value_text = if is_editing {
+                            let buf = editing_buf.as_deref().unwrap_or("");
+                            format!("{}_", buf)
+                        } else {
+                            match current {
+                                Some(c) => String::from(&c),
+                                None => "—".into(),
+                            }
+                        };
 
-            return finalize_modal(
-                term_window,
-                &font,
-                &metrics,
-                elements,
-                solid_bg_color,
-                solid_fg_color,
-                padding_left,
-                grid_origin_y,
-                cell_w,
-                cell_h,
-                size,
-                dimensions,
-            );
-        }
-
-        // Scroll indicator if rows are hidden above.
-        if top_row > 0 {
-            elements.push(render_scroll_indicator(&font, "↑ more above", &solid_fg_color));
-        }
-
-        // Visible slice of rows.
-        for (idx, row) in rows_def.iter().enumerate().skip(top_row).take(max_rows) {
-            let is_selected = idx == selected;
-            match *row {
-                RowKind::Section(label) => {
-                    elements.push(render_section(&font, label, &solid_fg_color));
-                }
-                RowKind::Field(field) => {
-                    let is_editing = is_selected && editing_buf.is_some();
-                    let current = self.current_value(field);
-                    let swatch = current.map(|c| c.deref().to_linear());
-
-                    let value_text = if is_editing {
-                        let buf = editing_buf.as_deref().unwrap_or("");
-                        format!("{}_", buf)
-                    } else {
-                        match current {
-                            Some(c) => String::from(&c),
-                            None => "—".into(),
-                        }
-                    };
-
-                    elements.push(render_row(
-                        &font,
-                        field.label(),
-                        value_text,
-                        swatch,
-                        is_selected,
-                        &solid_bg_color,
-                        &solid_fg_color,
-                    ));
-                }
-                RowKind::Export => {
-                    let label = format!(
-                        "Export `{}` to ~/.config/wezterm/colors/{}.toml",
-                        self.scheme_name, self.scheme_name
-                    );
-                    elements.push(render_row(
-                        &font,
-                        label,
-                        "↵".into(),
-                        None,
-                        is_selected,
-                        &solid_bg_color,
-                        &solid_fg_color,
-                    ));
+                        body_elements.push(render_row(
+                            &font,
+                            field.label(),
+                            value_text,
+                            swatch,
+                            is_selected,
+                            &solid_bg_color,
+                            &solid_fg_color,
+                        ));
+                    }
+                    RowKind::Export => {
+                        let label = format!(
+                            "Export `{}` to ~/.config/wezterm/colors/{}.toml",
+                            self.scheme_name, self.scheme_name
+                        );
+                        body_elements.push(render_row(
+                            &font,
+                            label,
+                            "↵".into(),
+                            None,
+                            is_selected,
+                            &solid_bg_color,
+                            &solid_fg_color,
+                        ));
+                    }
                 }
             }
-        }
-
-        // Scroll indicator if rows are hidden below.
-        if top_row + max_rows < rows_def.len() {
-            elements.push(render_scroll_indicator(
-                &font,
-                "↓ more below",
-                &solid_fg_color,
-            ));
+            if top_row + max_rows < rows_def.len() {
+                body_elements.push(render_scroll_indicator(
+                    &font,
+                    "↓ more below",
+                    &solid_fg_color,
+                ));
+            }
         }
 
         // Footer: editing hint OR error OR default hint.
         let footer_text = if let Some(err) = self.error.borrow().as_ref() {
             format!("! {}", err)
+        } else if picker_state.is_some() {
+            "↑↓←→ pick  Shift+←/→ hue  ↵ save  Esc back".into()
         } else if editing_buf.is_some() {
             "Type a hex color (#rrggbb), Enter to save, Esc to cancel, empty to unset".into()
         } else if self.file_path.borrow().is_some() {
@@ -902,21 +939,52 @@ impl ThemeBuilder {
         } else {
             "↵ export  Esc close".into()
         };
-        elements.push(
-            Element::new(&font, ElementContent::Text(footer_text))
-                .colors(ElementColors {
-                    border: BorderColor::default(),
-                    bg: LinearRgba::TRANSPARENT.into(),
-                    text: solid_fg_color.clone(),
-                })
-                .padding(BoxDimension {
-                    left: Dimension::Cells(0.25),
-                    right: Dimension::Cells(0.25),
-                    top: Dimension::Cells(0.5),
-                    bottom: Dimension::Cells(0.),
-                })
-                .display(DisplayType::Block),
-        );
+        let footer_element = Element::new(&font, ElementContent::Text(footer_text))
+            .colors(ElementColors {
+                border: BorderColor::default(),
+                bg: LinearRgba::TRANSPARENT.into(),
+                text: solid_fg_color.clone(),
+            })
+            .padding(BoxDimension {
+                left: Dimension::Cells(0.25),
+                right: Dimension::Cells(0.25),
+                top: Dimension::Cells(0.5),
+                bottom: Dimension::Cells(0.),
+            })
+            .display(DisplayType::Block);
+
+        // Decide whether the preview column fits. Needs body + preview +
+        // modal chrome (~6 cells of padding/border) in the visible terminal.
+        const BODY_COL_CELLS: usize = 46;
+        const CHROME_CELLS: usize = 6;
+        let want_preview_width =
+            BODY_COL_CELLS + preview::PREVIEW_WIDTH_CELLS + CHROME_CELLS;
+        let show_preview = size.cols >= want_preview_width;
+
+        let (elements, desired_width_cells) = if show_preview {
+            let (prev_palette, prev_zones) = self.preview_colors();
+            let body_col = Element::new(&font, ElementContent::Children(body_elements))
+                .display(DisplayType::Inline)
+                .min_width(Some(Dimension::Cells(BODY_COL_CELLS as f32)))
+                .max_width(Some(Dimension::Cells(BODY_COL_CELLS as f32)));
+            let preview_col =
+                preview::render_preview(&prev_palette, &prev_zones, &font, &solid_fg_color);
+            let two_col = Element::new(
+                &font,
+                ElementContent::Children(vec![body_col, preview_col]),
+            )
+            .display(DisplayType::Block);
+            (
+                vec![title_element, two_col, footer_element],
+                want_preview_width,
+            )
+        } else {
+            let mut out = Vec::with_capacity(2 + body_elements.len());
+            out.push(title_element);
+            out.extend(body_elements);
+            out.push(footer_element);
+            (out, 60_usize)
+        };
 
         finalize_modal(
             term_window,
@@ -931,6 +999,7 @@ impl ThemeBuilder {
             cell_h,
             size,
             dimensions,
+            desired_width_cells,
         )
     }
 
@@ -1373,5 +1442,107 @@ mod tests {
         let top = *b.top_row.borrow();
         assert!(top <= 15);
         assert!(15 < top + 5);
+    }
+
+    fn select_field(b: &ThemeBuilder, field: ColorField) {
+        let rows = b.rows();
+        let idx = rows
+            .iter()
+            .position(|r| matches!(r, RowKind::Field(f) if *f == field))
+            .expect("field present");
+        *b.selected_row.borrow_mut() = idx;
+    }
+
+    #[test]
+    fn preview_colors_returns_committed_when_not_editing() {
+        let b = builder_with_rows(Some("/tmp/x.toml".into()));
+        let committed = RgbaColor::from((0x10u8, 0x20, 0x30));
+        b.set_value(ColorField::Zone(ZoneField::Input), Some(committed));
+        let (_palette, zones) = b.preview_colors();
+        assert_eq!(zones.input_bg, Some(committed));
+    }
+
+    #[test]
+    fn preview_colors_overlays_valid_hex_on_edited_field() {
+        let b = builder_with_rows(Some("/tmp/x.toml".into()));
+        b.set_value(
+            ColorField::Zone(ZoneField::Input),
+            Some(RgbaColor::from((0x10u8, 0x20, 0x30))),
+        );
+        select_field(&b, ColorField::Zone(ZoneField::Input));
+        *b.editing.borrow_mut() = Some("#aabbcc".into());
+        let (_palette, zones) = b.preview_colors();
+        assert_eq!(zones.input_bg, Some(RgbaColor::from((0xaau8, 0xbb, 0xcc))));
+    }
+
+    #[test]
+    fn preview_colors_falls_back_to_committed_on_partial_hex() {
+        let b = builder_with_rows(Some("/tmp/x.toml".into()));
+        let committed = RgbaColor::from((0x10u8, 0x20, 0x30));
+        b.set_value(ColorField::Zone(ZoneField::Input), Some(committed));
+        select_field(&b, ColorField::Zone(ZoneField::Input));
+        *b.editing.borrow_mut() = Some("#aa".into());
+        let (_palette, zones) = b.preview_colors();
+        assert_eq!(zones.input_bg, Some(committed));
+    }
+
+    #[test]
+    fn preview_colors_falls_back_to_committed_on_empty_buffer() {
+        let b = builder_with_rows(Some("/tmp/x.toml".into()));
+        let committed = RgbaColor::from((0x10u8, 0x20, 0x30));
+        b.set_value(ColorField::Zone(ZoneField::Input), Some(committed));
+        select_field(&b, ColorField::Zone(ZoneField::Input));
+        *b.editing.borrow_mut() = Some("".into());
+        let (_palette, zones) = b.preview_colors();
+        assert_eq!(zones.input_bg, Some(committed));
+    }
+
+    #[test]
+    fn preview_colors_overlays_core_field() {
+        let b = builder_with_rows(Some("/tmp/x.toml".into()));
+        select_field(&b, ColorField::Core(CoreField::Foreground));
+        *b.editing.borrow_mut() = Some("#112233".into());
+        let (palette, _zones) = b.preview_colors();
+        assert_eq!(
+            palette.foreground,
+            Some(RgbaColor::from((0x11u8, 0x22, 0x33)))
+        );
+    }
+
+    #[test]
+    fn preview_colors_overlays_ansi_slot() {
+        let b = builder_with_rows(Some("/tmp/x.toml".into()));
+        select_field(&b, ColorField::Ansi(1));
+        *b.editing.borrow_mut() = Some("#ff0000".into());
+        let (palette, _zones) = b.preview_colors();
+        let ansi = palette.ansi.expect("ansi array populated by overlay");
+        assert_eq!(ansi[1], RgbaColor::from((0xffu8, 0x00, 0x00)));
+    }
+
+    #[test]
+    fn preview_colors_overlays_bright_slot() {
+        let b = builder_with_rows(Some("/tmp/x.toml".into()));
+        select_field(&b, ColorField::Bright(3));
+        *b.editing.borrow_mut() = Some("#00ff00".into());
+        let (palette, _zones) = b.preview_colors();
+        let brights = palette.brights.expect("brights array populated by overlay");
+        assert_eq!(brights[3], RgbaColor::from((0x00u8, 0xff, 0x00)));
+    }
+
+    #[test]
+    fn preview_colors_overlays_only_selected_field() {
+        let b = builder_with_rows(Some("/tmp/x.toml".into()));
+        // Commit a baseline for Output so we can confirm it survives.
+        let committed_output = RgbaColor::from((0x40u8, 0x40, 0x40));
+        b.set_value(ColorField::Zone(ZoneField::Output), Some(committed_output));
+        // Edit Input, not Output.
+        select_field(&b, ColorField::Zone(ZoneField::Input));
+        *b.editing.borrow_mut() = Some("#abcdef".into());
+        let (_palette, zones) = b.preview_colors();
+        assert_eq!(
+            zones.input_bg,
+            Some(RgbaColor::from((0xabu8, 0xcd, 0xef)))
+        );
+        assert_eq!(zones.output_bg, Some(committed_output));
     }
 }

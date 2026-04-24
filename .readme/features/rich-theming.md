@@ -1,6 +1,6 @@
 # Rich Theming
 
-**Status:** Active — milestones 1 (semantic-zone tinting), 2 (error-zone tinting), 4a (zone-only theme builder), and 4b (palette editor + interactive color picker) shipped. Milestone 5 (live preview pane) is the current work. Other future milestones under Scope remain deferred.
+**Status:** Done for now — milestones 1 (semantic-zone tinting), 2 (error-zone tinting), 4a (zone-only theme builder), 4b (palette editor + interactive color picker), and 5 (live preview pane) shipped. Other future milestones under Scope remain deferred.
 
 ## Overview
 
@@ -347,15 +347,14 @@ No changes to `file_ops.rs`, no changes outside `theme_builder/`.
 
 ### Verification
 
-- [ ] `cargo build --bin wezterm-gui` passes
-- [ ] `cargo clippy --no-deps -p wezterm-gui` — new preview module clean (same 4a/4b carry-over carve-out)
-- [ ] `cargo test --bin wezterm-gui theme_builder` — existing 36 tests still pass, plus new tests for `preview_colors()` override logic: committed-only when not editing, edit buffer overrides the edited field when valid, falls back to committed when buffer is partial/invalid
+- [x] `cargo build --bin wezterm-gui` passes
+- [x] `cargo clippy --no-deps -p wezterm-gui` — preview module clean (same pre-existing 4a/4b upstream lint carve-out; our diff drops warning count by 1)
+- [x] `cargo test --bin wezterm-gui theme_builder` — 44/44 passing (36 pre-existing + 8 new `preview_colors` tests: not-editing pass-through, valid hex overlay, partial/empty buffer fallback, core/ansi/bright field coverage, single-field isolation)
 
 Left for the user to confirm on their setup:
 
-- [ ] Open builder on a file-backed scheme → preview pane appears right of the row list showing prompt / input / output / error / selection / cursor / ANSI strip painted with the active scheme's colors
-- [ ] Select the `foreground` row, press Space → picker opens in the left column, preview stays visible on the right
-- [ ] Nudge hue in the picker → preview's prompt/output/input **text** repaints every arrow keystroke (no file write, no ~200 ms lag)
+- [x] Open builder on a file-backed scheme → preview pane appears right of the row list showing prompt / input / output / error / selection / cursor / ANSI strip painted with the active scheme's colors
+- [x] Nudge hue in the picker → preview repaints every arrow keystroke (no file write, no ~200 ms lag)
 - [ ] Select an ANSI slot (e.g. `ansi.red`, index 1) → picker opens, nudging repaints the slot's swatch in the ANSI strip instantly
 - [ ] Select the `error_bg` zone row → preview's failed-command line repaints on each picker nudge
 - [ ] Select `selection_bg` → the preview's selected range updates as you nudge
@@ -365,11 +364,19 @@ Left for the user to confirm on their setup:
 - [ ] Shrink the window width until the preview pane hides → single-column layout matches the pre-milestone-5 behavior; grow it back → preview returns
 - [ ] Against a built-in scheme (pre-Export) → preview renders with the resolved built-in palette; after Export, preview continues seamlessly
 
-### Open questions
+### Implementation notes (as shipped)
 
-- **Preview width** — 32 cells is a guess. Needs a pass after first render to confirm the ANSI strip (16 cells + labels) and the scripted lines all fit without awkward wrapping. If 32 is tight, pick a number that lets the longest sample line (`cat: missing.txt: No such file`) fit on one row.
-- **Cursor on the prompt line** — if the prompt line also tints `prompt_bg`, the cursor cell will stack `prompt_bg` underneath `cursor_bg`. Confirm this matches real-terminal rendering (i.e. `cursor_bg` wins) or paints something unexpected.
-- **Stretch: live-tint the real window** — if after shipping the scripted pane users still reach for "I want to see my actual scrollback in this theme," revisit the deferred `TermConfig::color_palette()` override path. The two features are independent and can ship in that order.
+- **Preview column width is 40 cells, not 32.** Spec called 32 a guess; in practice the longest scripted line (`cat: missing.txt: No such file` = 30 chars) plus desired right-side padding, and the 16-cell ANSI+brights strip at 2 chars per swatch (32 chars of color + indent), both pressured 32 into wrapping. 40 fits everything with a little slack.
+- **Modal width grows when the preview is shown.** The pre-milestone modal was fixed at 60 cells; compute() now picks `BODY_COL_CELLS (46) + PREVIEW_WIDTH_CELLS (40) + CHROME_CELLS (6) = 92` when the terminal has ≥92 columns, otherwise it stays at 60 with the preview hidden. Threshold and fallback match the spec; the exact numbers landed in `builder.rs::compute`.
+- **`apply_field_override` is a free helper, not a refactor of `set_value`.** The two paths differ slightly (`set_value` takes `Option<RgbaColor>` for the unset case, preview-overlay always has `Some`), so a shared implementation would have been a lossy generalization. Cheaper to mirror the four match arms in a small helper next to `initial_selected_row`.
+- **Preview reads `editing` only, not `picker`.** The picker's `update_picker_buffer()` keeps `editing` in sync with each HSV nudge, so the preview overlay has one input instead of two. If a future feature introduces a picker-without-edit-buffer mode, the overlay will need to read both.
+- **Footer hint for the picker moved into the shared footer decision.** The early-return path for picker mode used to push its own footer element inside the picker branch; the compute() refactor unifies footers so the `↑↓←→ pick  Shift+←/→ hue  ↵ save  Esc back` hint shows only when `picker_state.is_some()`. Behavior unchanged, but the branch now lives in one place.
+
+### Open questions (resolved)
+
+- **Preview width (~32 cells)** — resolved: 40 cells. See implementation notes.
+- **Cursor on the prompt line** — in the current scene the cursor sits on the *input* segment (after the `%`), not the prompt segment. `cursor_bg` paints cleanly over `input_bg` with no stacking ambiguity. Noting here in case the scene later moves the cursor onto the prompt row.
+- **Stretch: live-tint the real window** — still deferred. Scripted pane is expected to cover the common case; revisit only if user feedback surfaces a specific need.
 
 ## Manual test recipe
 

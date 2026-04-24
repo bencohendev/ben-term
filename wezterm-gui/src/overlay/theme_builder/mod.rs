@@ -8,6 +8,7 @@
 pub mod builder;
 pub mod file_ops;
 pub mod picker;
+pub mod preview;
 
 use crate::termwindow::TermWindow;
 use std::rc::Rc;
