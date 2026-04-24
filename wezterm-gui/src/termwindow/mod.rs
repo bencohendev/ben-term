@@ -111,6 +111,11 @@ pub fn get_window_class() -> String {
 pub enum MouseCapture {
     UI,
     TerminalPane(PaneId),
+    /// The active modal has captured the mouse following a press whose
+    /// `mouse_press_pixel` returned `ModalPressResult::Capture`. Motion
+    /// and release route to the modal's drag/release hooks until the
+    /// button comes up. Used by the theme builder's HSV picker.
+    Modal,
 }
 
 /// Type used together with Window::notify to do something in the

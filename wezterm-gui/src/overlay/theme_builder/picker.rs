@@ -9,24 +9,27 @@
 //!   - Esc: close picker, restore the hex buffer that was
 //!     in place before the picker opened
 //!
-//! Mouse click/drag is a deliberate non-goal for 4b — keyboard alone gets
-//! us a usable picker without plumbing pixel-level bounds through the
-//! Modal trait. Mouse support can ride on top later without reshaping
-//! this module.
+//! Mouse-driven (milestone 6):
+//!   - Click inside SV grid: set (sat, val) at the cell under the cursor
+//!   - Click inside hue bar: set hue at the cell under the cursor
+//!   - Drag from either: continuous update; clamped to the captured
+//!     rect's edges when the pointer moves outside
+//!   - Release: ends drag capture; no commit (Enter still commits)
 //!
 //! Render: 16×8 SV grid + 24-cell hue bar, all solid-bg Element rects.
 //! Cursor cells show a contrasting marker so the active (sat, val) and
 //! hue positions are visible against their color.
 
 use crate::termwindow::box_model::{
-    BorderColor, BoxDimension, DisplayType, Element, ElementColors, ElementContent,
-    InheritableColor,
+    BorderColor, BoxDimension, ComputedElement, ComputedElementContent, DisplayType, Element,
+    ElementColors, ElementContent, InheritableColor,
 };
 use config::{Dimension, RgbaColor};
 use std::ops::Deref;
 use std::rc::Rc;
 use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
+use window::RectF;
 
 const SV_COLS: usize = 16;
 const SV_ROWS: usize = 8;
@@ -96,6 +99,121 @@ impl PickerState {
     pub fn hue_step() -> f32 {
         HUE_STEP
     }
+}
+
+/// Recorded pixel bounds of the picker's interactive regions, captured
+/// during the builder's `compute()` call and consulted by the mouse
+/// handlers. Coordinates are in window-absolute pixels (same space as
+/// `MouseEvent::coords`).
+#[derive(Debug, Clone, Copy)]
+pub struct PickerLayout {
+    pub sv_rect: RectF,
+    pub hue_rect: RectF,
+}
+
+/// Which of the picker's interactive regions a pixel point falls inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerHit {
+    Sv,
+    Hue,
+    None,
+}
+
+impl PickerLayout {
+    pub fn hit(&self, pt: (f32, f32)) -> PickerHit {
+        let p = euclid::point2(pt.0, pt.1);
+        if self.sv_rect.contains(p) {
+            PickerHit::Sv
+        } else if self.hue_rect.contains(p) {
+            PickerHit::Hue
+        } else {
+            PickerHit::None
+        }
+    }
+
+    /// Walk a computed modal tree to recover the picker's pixel bounds.
+    /// We don't want to hard-index into the tree (the outer structure
+    /// changes when the preview pane is hidden) so we look for a
+    /// container whose children match the picker's distinctive shape: a
+    /// run of 8 consecutive rows with exactly `SV_COLS` children each,
+    /// followed (somewhere in the trailing children) by a row with
+    /// exactly `HUE_CELLS` children. Only one element in the theme
+    /// builder matches that shape, so false positives are effectively
+    /// impossible.
+    pub fn from_computed_elements(roots: &[ComputedElement]) -> Option<Self> {
+        for root in roots {
+            if let Some(layout) = find_picker_layout(root) {
+                return Some(layout);
+            }
+        }
+        None
+    }
+}
+
+fn find_picker_layout(node: &ComputedElement) -> Option<PickerLayout> {
+    let kids = match &node.content {
+        ComputedElementContent::Children(k) => k,
+        _ => return None,
+    };
+    if let Some(layout) = layout_from_picker_children(kids) {
+        return Some(layout);
+    }
+    for kid in kids {
+        if let Some(layout) = find_picker_layout(kid) {
+            return Some(layout);
+        }
+    }
+    None
+}
+
+fn layout_from_picker_children(kids: &[ComputedElement]) -> Option<PickerLayout> {
+    if kids.len() < 9 {
+        return None;
+    }
+    // 8 consecutive SV rows at the head, each with exactly SV_COLS children.
+    for kid in kids.iter().take(8) {
+        match &kid.content {
+            ComputedElementContent::Children(grand) if grand.len() == SV_COLS => {}
+            _ => return None,
+        }
+    }
+    // SV rect spans all 8 rows' outer bounds. `euclid::Rect::union` merges
+    // them; initial fold seed is the first row.
+    let sv_rect = kids
+        .iter()
+        .take(8)
+        .map(|k| k.bounds)
+        .reduce(|a, b| a.union(&b))?;
+    // Hue row: first element in the tail that has exactly HUE_CELLS children.
+    let hue_rect = kids
+        .iter()
+        .skip(8)
+        .find(|k| matches!(&k.content, ComputedElementContent::Children(g) if g.len() == HUE_CELLS))?
+        .bounds;
+    Some(PickerLayout { sv_rect, hue_rect })
+}
+
+/// Update the picker's `(sat, val)` from a pixel coordinate inside (or
+/// near) the SV rect. Out-of-rect coordinates are clamped to the rect's
+/// edges so a drag that leaves the grid still tracks cleanly.
+pub fn sv_point_to_state(state: &mut PickerState, rect: RectF, pt: (f32, f32)) {
+    let w = rect.width().max(1.0);
+    let h = rect.height().max(1.0);
+    let fx = ((pt.0 - rect.min_x()) / w).clamp(0.0, 1.0);
+    let fy = ((pt.1 - rect.min_y()) / h).clamp(0.0, 1.0);
+    // y grows downward but val grows upward — brightest row is the top.
+    state.sat = fx;
+    state.val = 1.0 - fy;
+}
+
+/// Update the picker's hue from a pixel coordinate inside (or near) the
+/// hue rect. Clamped to the rect's horizontal edges; hue never wraps on
+/// mouse input (users who want wrap-around can Shift-arrow).
+pub fn hue_point_to_state(state: &mut PickerState, rect: RectF, pt: (f32, f32)) {
+    let w = rect.width().max(1.0);
+    let fx = ((pt.0 - rect.min_x()) / w).clamp(0.0, 1.0);
+    // Clamp the top end just below 360° so (360° wraps to 0°) stays off.
+    state.hue = (fx * 360.0).min(359.999);
 }
 
 /// Parse `#rgb` / `#rrggbb` (case-insensitive). Returns None for anything
@@ -398,5 +516,89 @@ mod tests {
         assert!((s.hue - 330.0).abs() < 0.01);
         s.nudge_hue(60.0);
         assert!((s.hue - 30.0).abs() < 0.01);
+    }
+
+    fn layout(sv: RectF, hue: RectF) -> PickerLayout {
+        PickerLayout {
+            sv_rect: sv,
+            hue_rect: hue,
+        }
+    }
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> RectF {
+        euclid::rect(x, y, w, h)
+    }
+
+    #[test]
+    fn hit_dispatches_by_region() {
+        let l = layout(rect(10., 20., 100., 80.), rect(10., 110., 100., 10.));
+        assert_eq!(l.hit((50., 50.)), PickerHit::Sv);
+        assert_eq!(l.hit((50., 115.)), PickerHit::Hue);
+        // Above SV, outside both rects.
+        assert_eq!(l.hit((50., 5.)), PickerHit::None);
+        // Between SV and hue, outside both rects.
+        assert_eq!(l.hit((50., 105.)), PickerHit::None);
+    }
+
+    #[test]
+    fn sv_point_center_of_rect_is_mid_sat_mid_val() {
+        let mut s = PickerState::from_buffer("#000000", None);
+        sv_point_to_state(&mut s, rect(0., 0., 100., 100.), (50., 50.));
+        assert!((s.sat - 0.5).abs() < 0.01);
+        assert!((s.val - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn sv_point_top_left_is_zero_sat_full_val() {
+        let mut s = PickerState::from_buffer("#000000", None);
+        sv_point_to_state(&mut s, rect(0., 0., 100., 100.), (0., 0.));
+        assert!(s.sat.abs() < 0.01);
+        assert!((s.val - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn sv_point_bottom_right_is_full_sat_zero_val() {
+        let mut s = PickerState::from_buffer("#000000", None);
+        sv_point_to_state(&mut s, rect(0., 0., 100., 100.), (100., 100.));
+        assert!((s.sat - 1.0).abs() < 0.01);
+        assert!(s.val.abs() < 0.01);
+    }
+
+    #[test]
+    fn sv_point_outside_rect_clamps() {
+        let mut s = PickerState::from_buffer("#000000", None);
+        // Way above and to the left: clamps to top-left.
+        sv_point_to_state(&mut s, rect(10., 10., 100., 100.), (-50., -50.));
+        assert!(s.sat.abs() < 0.01);
+        assert!((s.val - 1.0).abs() < 0.01);
+        // Way below and to the right: clamps to bottom-right.
+        sv_point_to_state(&mut s, rect(10., 10., 100., 100.), (1000., 1000.));
+        assert!((s.sat - 1.0).abs() < 0.01);
+        assert!(s.val.abs() < 0.01);
+    }
+
+    #[test]
+    fn hue_point_scans_0_to_near_360() {
+        let mut s = PickerState::from_buffer("#ff0000", None);
+        let r = rect(0., 0., 360., 10.);
+        hue_point_to_state(&mut s, r, (0., 5.));
+        assert!(s.hue.abs() < 0.1);
+        hue_point_to_state(&mut s, r, (180., 5.));
+        assert!((s.hue - 180.).abs() < 0.1);
+        // At exact right edge, hue should clamp just under 360 so it
+        // doesn't wrap back to zero.
+        hue_point_to_state(&mut s, r, (360., 5.));
+        assert!(s.hue < 360.0);
+        assert!(s.hue > 359.0);
+    }
+
+    #[test]
+    fn hue_point_clamps_outside_rect() {
+        let mut s = PickerState::from_buffer("#ff0000", None);
+        let r = rect(100., 0., 100., 10.);
+        hue_point_to_state(&mut s, r, (50., 5.)); // left of rect
+        assert!(s.hue.abs() < 0.1);
+        hue_point_to_state(&mut s, r, (999., 5.)); // right of rect
+        assert!(s.hue > 359.0);
     }
 }

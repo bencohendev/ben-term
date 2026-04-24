@@ -420,10 +420,10 @@ Adds click + drag to the HSV picker's SV square and hue bar. Keyboard nudges sta
 
 ### Verification
 
-- `cargo build --bin wezterm-gui` passes
-- `cargo clippy --no-deps -p wezterm-gui` — no new warnings in picker / modal code
-- `cargo test --bin wezterm-gui theme_builder` — new: SV-rect hit-test, hue-rect hit-test, out-of-rect clamp, drag continues updating when moved outside rect, press outside both rects returns `Passthrough`
-- `cargo test -p wezterm-gui` — existing modals (palette/charselect/paneselect/popup_picker) still compile and behave under the new `ModalPressResult` signature
+- [x] `cargo build --release` passes
+- [x] `cargo clippy --no-deps -p wezterm-gui` — no new warnings in modal / picker / theme_builder / new mouseevent code (the 364 pre-existing upstream warnings and 1 pre-existing `inputmap.rs:698` error stay unchanged — same carve-out as 4a/4b/5)
+- [x] `cargo test --bin wezterm-gui theme_builder` — 63/63 passing (44 pre-existing + 7 picker layout/helpers + 12 new drag lifecycle tests: start/continue/end, SV/hue region isolation, out-of-rect clamp, stale-layout guard, invalidate preserves layout)
+- [x] `cargo test -p wezterm-gui` — 127/127 passing (existing modals palette / charselect / paneselect / popup_picker stay correct under the new `ModalPressResult` signature)
 
 Left for the user to confirm on their setup:
 
@@ -434,6 +434,15 @@ Left for the user to confirm on their setup:
 - Click inside the row list (outside picker rects) → no effect; no ghost row-edit triggers
 - Click outside the modal entirely → modal dismisses (click-away unchanged)
 - After mouse picks, arrow-nudge keyboard still works from the new (hue, sat, val); Enter commits
+
+### Implementation notes (as shipped)
+
+- **Testable cores split out.** The Modal trait methods (`mouse_press_pixel` / `mouse_drag_pixel` / `mouse_release_pixel`) are thin wrappers over `start_picker_drag` / `continue_picker_drag` / `end_picker_drag` on `ThemeBuilder`. Keeping the state-machine logic in non-trait methods makes the drag lifecycle unit-testable without constructing a `TermWindow`. 12 new tests cover press/drag/release, clamping, region isolation, and stale-layout guards.
+- **`invalidate()` no longer drops `picker_layout`.** The cache used to clear both the element tree and the derived picker rects together. During a drag, every motion event calls `update_picker_buffer` → `invalidate` → no element → next frame's `computed_element` re-derives `picker_layout` from the fresh tree. But between invalidate and the next compute, `continue_picker_drag` still needs the rect for hit-math. So `invalidate()` now drops only the element tree; `picker_layout` stays through the gap and is reseeded on the next `refresh_picker_layout`. A stale-layout guard in `start_picker_drag` (early return if `picker` is None) handles the brief window after a cancel where the layout outlives the open-picker state.
+- **`PickerLayout::from_computed_elements` recognizes the picker by structural signature**, not tree path. Walks the computed tree depth-first and picks the container whose first 8 children each have exactly `SV_COLS` (=16) sub-children, followed later by a row with exactly `HUE_CELLS` (=24). One element in the theme builder matches that shape, so false positives are effectively impossible — and it stays robust if the outer body/preview-column layout shifts.
+- **`MouseCapture::Modal` reuses the existing capture gate.** `mouse_event_impl` already short-circuits UI-item and terminal-pane dispatch when `current_mouse_capture` is set; adding a `Modal` variant lets the picker's drag interaction ride the same plumbing instead of introducing a parallel capture flag.
+- **In-modal-not-on-picker presses stay `Passthrough`** to preserve pre-milestone-6 click semantics. The spec decision documented this explicitly; Consume-instead was considered but would change click-on-editing-row behavior (it would swallow clicks that currently fall through) — out of scope for a mouse-polish milestone.
+- **`mouseevent.rs` calls `context.invalidate()` on the captured-drag path** so the next paint is queued after every motion update — mirrors how the other in-window dispatch paths request repaints.
 
 ## Manual test recipe
 

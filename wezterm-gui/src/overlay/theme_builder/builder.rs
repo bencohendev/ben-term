@@ -23,13 +23,15 @@ use super::file_ops::{
     export_target_path, export_theme_to_file, resolve_scheme_file, write_color_field, ColorField,
     CoreField, ZoneField,
 };
-use super::picker::{render_picker, PickerState};
+use super::picker::{
+    hue_point_to_state, render_picker, sv_point_to_state, PickerHit, PickerLayout, PickerState,
+};
 use super::preview;
 use crate::termwindow::box_model::{
     BorderColor, BoxDimension, ComputedElement, Corners, DisplayType, Element, ElementColors,
     ElementContent, InheritableColor, LayoutContext, SizedPoly,
 };
-use crate::termwindow::modal::Modal;
+use crate::termwindow::modal::{Modal, ModalPressResult};
 use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
     TOP_RIGHT_ROUNDED_CORNER,
@@ -99,6 +101,18 @@ pub struct ThemeBuilder {
     error: RefCell<Option<String>>,
 
     element: RefCell<Option<Vec<ComputedElement>>>,
+    /// Pixel bounds of the HSV picker's SV grid and hue bar, captured at
+    /// the tail of each `compute()` when the picker is open. `None` when
+    /// the picker isn't showing; the mouse press handler consults this
+    /// to decide whether to start a drag capture. Separate from `picker`
+    /// because the layout is derived from the computed tree, not from
+    /// `PickerState`.
+    picker_layout: RefCell<Option<PickerLayout>>,
+    /// Which region the active drag began in (set by press, read by
+    /// drag/release, cleared on release). Separating this from
+    /// `picker_layout` lets a drag continue to track even if layout
+    /// recomputes produce a slightly shifted rect.
+    drag_region: RefCell<Option<PickerHit>>,
 }
 
 impl ThemeBuilder {
@@ -135,6 +149,8 @@ impl ThemeBuilder {
             picker: RefCell::new(None),
             error: RefCell::new(None),
             element: RefCell::new(None),
+            picker_layout: RefCell::new(None),
+            drag_region: RefCell::new(None),
         })
     }
 
@@ -336,7 +352,101 @@ impl ThemeBuilder {
     }
 
     fn invalidate(&self) {
+        // Only drop the element tree. `picker_layout` is derived from
+        // that tree but stays valid across state-only invalidations
+        // (keyboard nudges, drag motion) — the next compute reseeds it
+        // via `refresh_picker_layout` before the next mouse event lands.
+        // Holding it across the gap matters for mouse drag, which
+        // invalidates between every motion event.
         self.element.borrow_mut().take();
+    }
+
+    /// Walk the most-recently-computed element tree and cache the HSV
+    /// picker's SV and hue rects. Called at the tail of `computed_element`
+    /// so the rects are populated before the next mouse event arrives.
+    /// If the picker is closed or no tree is present the cache is cleared.
+    fn refresh_picker_layout(&self) {
+        if self.picker.borrow().is_none() {
+            self.picker_layout.borrow_mut().take();
+            return;
+        }
+        let layout = self
+            .element
+            .borrow()
+            .as_ref()
+            .and_then(|els| PickerLayout::from_computed_elements(els));
+        *self.picker_layout.borrow_mut() = layout;
+    }
+
+    /// Press-down on the HSV picker. Returns which region (if any) was
+    /// hit so the caller can decide whether to install a mouse capture.
+    /// This is the testable core of `mouse_press_pixel`'s picker path —
+    /// it intentionally does NOT invalidate the cached layout so tests
+    /// can inspect state without a repaint teardown.
+    fn start_picker_drag(&self, point: (f32, f32)) -> PickerHit {
+        // Stale layout guard: the layout is derived from the element
+        // tree and may survive a picker-close briefly. Require the
+        // picker to actually be open before activating a drag.
+        if self.picker.borrow().is_none() {
+            return PickerHit::None;
+        }
+        let layout = match *self.picker_layout.borrow() {
+            Some(l) => l,
+            None => return PickerHit::None,
+        };
+        match layout.hit(point) {
+            PickerHit::Sv => {
+                if let Some(state) = self.picker.borrow_mut().as_mut() {
+                    sv_point_to_state(state, layout.sv_rect, point);
+                }
+                self.update_picker_buffer();
+                *self.drag_region.borrow_mut() = Some(PickerHit::Sv);
+                PickerHit::Sv
+            }
+            PickerHit::Hue => {
+                if let Some(state) = self.picker.borrow_mut().as_mut() {
+                    hue_point_to_state(state, layout.hue_rect, point);
+                }
+                self.update_picker_buffer();
+                *self.drag_region.borrow_mut() = Some(PickerHit::Hue);
+                PickerHit::Hue
+            }
+            PickerHit::None => PickerHit::None,
+        }
+    }
+
+    /// Continue a drag in progress. Returns true if the picker state
+    /// changed (i.e. a drag was active and the region is live).
+    fn continue_picker_drag(&self, point: (f32, f32)) -> bool {
+        let region = match *self.drag_region.borrow() {
+            Some(r) => r,
+            None => return false,
+        };
+        let layout = match *self.picker_layout.borrow() {
+            Some(l) => l,
+            None => return false,
+        };
+        match region {
+            PickerHit::Sv => {
+                if let Some(state) = self.picker.borrow_mut().as_mut() {
+                    sv_point_to_state(state, layout.sv_rect, point);
+                }
+            }
+            PickerHit::Hue => {
+                if let Some(state) = self.picker.borrow_mut().as_mut() {
+                    hue_point_to_state(state, layout.hue_rect, point);
+                }
+            }
+            PickerHit::None => return false,
+        }
+        self.update_picker_buffer();
+        true
+    }
+
+    /// End a drag. Clears the capture-region flag; no commit side-effect
+    /// (matches keyboard: Enter still commits).
+    fn end_picker_drag(&self) {
+        self.drag_region.borrow_mut().take();
     }
 
     /// Enter edit mode for the currently selected row. Seeds the input
@@ -361,6 +471,7 @@ impl ThemeBuilder {
     fn cancel_edit(&self) {
         self.editing.borrow_mut().take();
         self.picker.borrow_mut().take();
+        self.drag_region.borrow_mut().take();
         self.error.borrow_mut().take();
         self.invalidate();
     }
@@ -402,6 +513,7 @@ impl ThemeBuilder {
         if let Some(buf) = saved {
             *self.editing.borrow_mut() = Some(buf);
         }
+        self.drag_region.borrow_mut().take();
         self.error.borrow_mut().take();
         self.invalidate();
     }
@@ -474,6 +586,7 @@ impl ThemeBuilder {
         self.set_value(field, parsed);
         self.editing.borrow_mut().take();
         self.picker.borrow_mut().take();
+        self.drag_region.borrow_mut().take();
         self.error.borrow_mut().take();
         self.invalidate();
     }
@@ -1016,14 +1129,40 @@ impl Modal for ThemeBuilder {
         Ok(())
     }
 
-    fn mouse_press_pixel(&self, point: (f32, f32), term_window: &TermWindow) -> bool {
+    fn mouse_press_pixel(&self, point: (f32, f32), term_window: &TermWindow) -> ModalPressResult {
+        // Picker mouse mode: if the press lands on the SV grid or hue
+        // bar, seed the picker's HSV from the press location and capture
+        // the mouse so subsequent motion is dispatched to
+        // `mouse_drag_pixel`. Out-of-picker presses fall through to the
+        // click-away path below.
+        match self.start_picker_drag(point) {
+            PickerHit::Sv | PickerHit::Hue => {
+                self.invalidate();
+                return ModalPressResult::Capture;
+            }
+            PickerHit::None => {}
+        }
+        // Clicks outside the modal dismiss it. Clicks inside but
+        // outside the picker fall through (preserves the pre-milestone-6
+        // behavior and keeps the "inside modal = passthrough" contract
+        // shared with `PopupPicker`).
         match self.hit_test(point) {
             Some(false) => {
                 term_window.cancel_modal();
-                true
+                ModalPressResult::Consume
             }
-            _ => false,
+            _ => ModalPressResult::Passthrough,
         }
+    }
+
+    fn mouse_drag_pixel(&self, point: (f32, f32), _term_window: &TermWindow) {
+        if self.continue_picker_drag(point) {
+            self.invalidate();
+        }
+    }
+
+    fn mouse_release_pixel(&self, _point: (f32, f32), _term_window: &TermWindow) {
+        self.end_picker_drag();
     }
 
     fn key_down(
@@ -1170,6 +1309,7 @@ impl Modal for ThemeBuilder {
         if self.element.borrow().is_none() {
             let element = self.compute(term_window)?;
             self.element.borrow_mut().replace(element);
+            self.refresh_picker_layout();
         }
 
         Ok(Ref::map(self.element.borrow(), |v| {
@@ -1179,6 +1319,7 @@ impl Modal for ThemeBuilder {
 
     fn reconfigure(&self, _term_window: &mut TermWindow) {
         self.element.borrow_mut().take();
+        self.picker_layout.borrow_mut().take();
     }
 }
 
@@ -1203,6 +1344,8 @@ mod tests {
             picker: RefCell::new(None),
             error: RefCell::new(None),
             element: RefCell::new(None),
+            picker_layout: RefCell::new(None),
+            drag_region: RefCell::new(None),
         }
     }
 
@@ -1544,5 +1687,171 @@ mod tests {
             Some(RgbaColor::from((0xabu8, 0xcd, 0xef)))
         );
         assert_eq!(zones.output_bg, Some(committed_output));
+    }
+
+    // Milestone 6: picker mouse input. These cover the pure state-machine
+    // parts of the drag lifecycle (press → drag → release) without
+    // exercising the surrounding Modal dispatch (which needs a full
+    // TermWindow). Real layout extraction is covered in `picker::tests`.
+
+    fn picker_open_builder() -> ThemeBuilder {
+        let b = builder_with_rows(Some("/tmp/x.toml".into()));
+        select_field(&b, ColorField::Zone(ZoneField::Input));
+        *b.editing.borrow_mut() = Some("#000000".into());
+        *b.picker.borrow_mut() = Some(PickerState::from_buffer("#000000", None));
+        // Seed a known picker layout: SV 100×100 at (0,0), hue 100×10 at (0,120).
+        *b.picker_layout.borrow_mut() = Some(PickerLayout {
+            sv_rect: euclid::rect(0., 0., 100., 100.),
+            hue_rect: euclid::rect(0., 120., 100., 10.),
+        });
+        b
+    }
+
+    #[test]
+    fn start_picker_drag_sv_sets_state_and_region() {
+        let b = picker_open_builder();
+        // Middle of the SV rect — sat ≈ 0.5, val ≈ 0.5.
+        let hit = b.start_picker_drag((50., 50.));
+        assert_eq!(hit, PickerHit::Sv);
+        assert_eq!(*b.drag_region.borrow(), Some(PickerHit::Sv));
+        let p = b.picker.borrow();
+        let s = p.as_ref().unwrap();
+        assert!((s.sat - 0.5).abs() < 0.01);
+        assert!((s.val - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn start_picker_drag_hue_sets_state_and_region() {
+        let b = picker_open_builder();
+        // 25% across the hue bar → ~90°.
+        let hit = b.start_picker_drag((25., 125.));
+        assert_eq!(hit, PickerHit::Hue);
+        assert_eq!(*b.drag_region.borrow(), Some(PickerHit::Hue));
+        let p = b.picker.borrow();
+        let s = p.as_ref().unwrap();
+        assert!((s.hue - 90.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn start_picker_drag_outside_rects_is_noop() {
+        let b = picker_open_builder();
+        let before = b.picker.borrow().as_ref().unwrap().clone();
+        let hit = b.start_picker_drag((200., 200.));
+        assert_eq!(hit, PickerHit::None);
+        assert!(b.drag_region.borrow().is_none());
+        let after = b.picker.borrow().as_ref().unwrap().clone();
+        assert_eq!(before.hue, after.hue);
+        assert_eq!(before.sat, after.sat);
+        assert_eq!(before.val, after.val);
+    }
+
+    #[test]
+    fn continue_picker_drag_tracks_motion_in_sv_region() {
+        let b = picker_open_builder();
+        b.start_picker_drag((50., 50.));
+        assert!(b.continue_picker_drag((25., 75.)));
+        let p = b.picker.borrow();
+        let s = p.as_ref().unwrap();
+        assert!((s.sat - 0.25).abs() < 0.01);
+        assert!((s.val - 0.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn continue_picker_drag_clamps_outside_rect() {
+        let b = picker_open_builder();
+        b.start_picker_drag((50., 50.));
+        // Well outside the SV rect — should clamp to max sat, min val.
+        assert!(b.continue_picker_drag((999., 999.)));
+        let p = b.picker.borrow();
+        let s = p.as_ref().unwrap();
+        assert!((s.sat - 1.0).abs() < 0.01);
+        assert!(s.val.abs() < 0.01);
+    }
+
+    #[test]
+    fn continue_picker_drag_without_press_is_noop() {
+        let b = picker_open_builder();
+        // No prior start_picker_drag call → drag_region is None.
+        assert!(!b.continue_picker_drag((50., 50.)));
+    }
+
+    #[test]
+    fn continue_picker_drag_hue_region_tracks_hue_only() {
+        let b = picker_open_builder();
+        b.start_picker_drag((0., 125.)); // hue start: 0°
+        assert!(b.continue_picker_drag((75., 125.))); // 75% → ~270°
+        let p = b.picker.borrow();
+        let s = p.as_ref().unwrap();
+        assert!((s.hue - 270.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn end_picker_drag_clears_region() {
+        let b = picker_open_builder();
+        b.start_picker_drag((50., 50.));
+        assert!(b.drag_region.borrow().is_some());
+        b.end_picker_drag();
+        assert!(b.drag_region.borrow().is_none());
+    }
+
+    #[test]
+    fn drag_does_not_cross_regions_after_press() {
+        // A drag that began in the SV rect but moves vertically into the
+        // hue rect keeps applying SV logic (clamped). We don't want
+        // dragging to jump axes mid-stroke — users would lose their
+        // in-progress value.
+        let b = picker_open_builder();
+        b.start_picker_drag((50., 50.));
+        let hue_before = b.picker.borrow().as_ref().unwrap().hue;
+        b.continue_picker_drag((50., 125.)); // into hue-rect y
+        let s = b.picker.borrow().as_ref().unwrap().clone();
+        // Hue unchanged — SV clamped to bottom edge.
+        assert!((s.hue - hue_before).abs() < 0.01);
+        assert!(s.val.abs() < 0.01); // clamped to val=0
+    }
+
+    #[test]
+    fn start_picker_drag_without_layout_is_noop() {
+        let b = builder_with_rows(Some("/tmp/x.toml".into()));
+        select_field(&b, ColorField::Zone(ZoneField::Input));
+        *b.picker.borrow_mut() = Some(PickerState::from_buffer("#000000", None));
+        // picker_layout intentionally unset.
+        let hit = b.start_picker_drag((50., 50.));
+        assert_eq!(hit, PickerHit::None);
+        assert!(b.drag_region.borrow().is_none());
+    }
+
+    #[test]
+    fn refresh_picker_layout_clears_when_picker_closed() {
+        let b = picker_open_builder();
+        // Simulate picker closing between computes.
+        *b.picker.borrow_mut() = None;
+        b.refresh_picker_layout();
+        assert!(b.picker_layout.borrow().is_none());
+    }
+
+    #[test]
+    fn cancel_picker_clears_in_progress_drag_region() {
+        // Picker Esc during a mouse drag must clear drag_region so a
+        // subsequent motion event doesn't find stale capture state.
+        let b = picker_open_builder();
+        b.start_picker_drag((50., 50.));
+        assert!(b.drag_region.borrow().is_some());
+        b.cancel_picker();
+        assert!(b.drag_region.borrow().is_none());
+    }
+
+    #[test]
+    fn invalidate_preserves_picker_layout_for_in_progress_drag() {
+        // invalidate() drops the element tree but leaves picker_layout
+        // intact so a drag whose press seeds a drag_region can keep
+        // tracking across the many invalidate()s that keyboard / motion
+        // callbacks trigger between motion events.
+        let b = picker_open_builder();
+        b.start_picker_drag((50., 50.));
+        assert!(b.picker_layout.borrow().is_some());
+        b.invalidate();
+        assert!(b.picker_layout.borrow().is_some());
+        assert_eq!(*b.drag_region.borrow(), Some(PickerHit::Sv));
     }
 }

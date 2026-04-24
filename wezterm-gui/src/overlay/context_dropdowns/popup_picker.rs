@@ -17,7 +17,7 @@ use crate::termwindow::box_model::{
     BorderColor, BoxDimension, ComputedElement, Corners, DisplayType, Element, ElementColors,
     ElementContent, InheritableColor, LayoutContext, SizedPoly,
 };
-use crate::termwindow::modal::Modal;
+use crate::termwindow::modal::{Modal, ModalPressResult};
 use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
     TOP_RIGHT_ROUNDED_CORNER,
@@ -450,14 +450,14 @@ impl Modal for PopupPicker {
     /// modal and is consumed so the shell underneath doesn't also react.
     /// A press inside the popup is left untouched (future work: row
     /// click-to-select). If the popup hasn't painted yet we can't
-    /// hit-test — in that rare case, don't consume.
-    fn mouse_press_pixel(&self, point: (f32, f32), term_window: &TermWindow) -> bool {
+    /// hit-test — in that rare case, pass through.
+    fn mouse_press_pixel(&self, point: (f32, f32), term_window: &TermWindow) -> ModalPressResult {
         match self.hit_test(point) {
             Some(false) => {
                 term_window.cancel_modal();
-                true
+                ModalPressResult::Consume
             }
-            _ => false,
+            _ => ModalPressResult::Passthrough,
         }
     }
 
