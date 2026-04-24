@@ -271,14 +271,14 @@ Extends semantic-zone tinting so Output cells that belong to a command which exi
 - [x] `cargo test -p config` — 13/13 passing (adds `test_semantic_zones_error_bg`)
 - [x] `cargo test -p wezterm-term` — 49/49 passing (no new tests; confirms existing semantic-zone flow still works)
 
-Left for the user to confirm on their setup:
+Confirmed on the user's setup:
 
-- [ ] Set `error_bg` in `zones-test.toml` (e.g. `error_bg = "#3a1f1f"`)
-- [ ] Run a successful command (`true` / `ls`) → output untinted or `output_bg` only
-- [ ] Run a failing command (`false` / `ls /does-not-exist`) → the command's output cells paint `error_bg`
-- [ ] Scrollback preserves the tint — scroll back up to a prior failed command, still red
-- [ ] Theme builder shows the new `Error output` row; editing it writes `error_bg` to TOML and re-paints live
-- [ ] Shell without OSC 133;D (or with broken integration) — no tinting regression on Output; `output_bg` still works
+- [x] Set `error_bg` in `zones-test.toml` (e.g. `error_bg = "#3a1f1f"`)
+- [x] Run a successful command (`true` / `ls`) → output untinted or `output_bg` only
+- [x] Run a failing command (`false` / `ls /does-not-exist`) → the command's output cells paint `error_bg`
+- [x] Scrollback preserves the tint — scroll back up to a prior failed command, still red
+- [x] Theme builder shows the new `Error output` row; editing it writes `error_bg` to TOML and re-paints live
+- [x] Shell without OSC 133;D (or with broken integration) — no tinting regression on Output; `output_bg` still works
 
 ### Implementation notes (as shipped)
 
