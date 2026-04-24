@@ -895,11 +895,30 @@ impl<'a> Performer<'a> {
                 FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { .. },
             ) => {
                 self.pen.set_semantic_type(SemanticType::Output);
+                let cursor_y = self.cursor.y;
+                self.command_start_stable_row =
+                    Some(self.screen().visible_row_to_stable_row(cursor_y));
             }
 
             OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::CommandStatus { .. },
-            ) => {}
+                FinalTermSemanticPrompt::CommandStatus { status, .. },
+            ) => {
+                let start = self.command_start_stable_row.take();
+                if status != 0 {
+                    if let Some(start) = start {
+                        let cursor_y = self.cursor.y;
+                        let end = self.screen().visible_row_to_stable_row(cursor_y);
+                        let seqno = self.seqno;
+                        let screen = self.screen_mut();
+                        let range = start.min(end)..=start.max(end);
+                        for stable in range {
+                            if let Some(phys) = screen.stable_row_to_phys(stable) {
+                                screen.line_mut(phys).set_command_failed(true, seqno);
+                            }
+                        }
+                    }
+                }
+            }
 
             OperatingSystemCommand::SystemNotification(message) => {
                 if let Some(handler) = self.alert_handler.as_mut() {

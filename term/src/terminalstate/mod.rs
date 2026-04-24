@@ -261,6 +261,14 @@ pub struct TerminalState {
 
     clear_semantic_attribute_on_newline: bool,
 
+    /// Stable row index where OSC 133;C marked the start of the current
+    /// command's output. Set on `MarkEndOfInputAndStartOfOutput`, consumed
+    /// and cleared on `CommandStatus`. None when no command is in flight or
+    /// the shell doesn't emit OSC 133;C. Used by the error-zone tint path
+    /// (rich-theming milestone 2) to stamp `IS_COMMAND_FAILED` on the right
+    /// range of lines.
+    command_start_stable_row: Option<StableRowIndex>,
+
     /// If true, writing a character inserts a new cell
     insert: bool,
 
@@ -522,6 +530,7 @@ impl TerminalState {
             left_and_right_margin_mode: false,
             wrap_next: false,
             clear_semantic_attribute_on_newline: false,
+            command_start_stable_row: None,
             // We default auto wrap to true even though the default for
             // a dec terminal is false, because it is more useful this way.
             dec_auto_wrap: true,

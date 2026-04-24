@@ -51,6 +51,10 @@ pub struct SemanticZoneColors {
     pub input_bg: Option<SrgbaTuple>,
     pub output_bg: Option<SrgbaTuple>,
     pub prompt_bg: Option<SrgbaTuple>,
+    /// Tint for Output cells belonging to a command that exited non-zero
+    /// (reported via OSC 133;D). When unset, failed-command output paints
+    /// `output_bg` as usual.
+    pub error_bg: Option<SrgbaTuple>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -65,6 +65,7 @@ pub enum ZoneField {
     Input,
     Output,
     Prompt,
+    Error,
 }
 
 impl ZoneField {
@@ -73,6 +74,7 @@ impl ZoneField {
             Self::Input => "input_bg",
             Self::Output => "output_bg",
             Self::Prompt => "prompt_bg",
+            Self::Error => "error_bg",
         }
     }
 
@@ -81,11 +83,12 @@ impl ZoneField {
             Self::Input => "Input background",
             Self::Output => "Output background",
             Self::Prompt => "Prompt background",
+            Self::Error => "Error output background",
         }
     }
 
-    pub fn all() -> [ZoneField; 3] {
-        [Self::Input, Self::Output, Self::Prompt]
+    pub fn all() -> [ZoneField; 4] {
+        [Self::Input, Self::Output, Self::Prompt, Self::Error]
     }
 }
 
@@ -431,6 +434,27 @@ input_bg = "#111"
         let out = zone_roundtrip(input, ZoneField::Input, Some("#222"));
         assert!(out.contains(r##"input_bg = "#222""##));
         assert!(!out.contains("#111"));
+    }
+
+    #[test]
+    fn writes_error_bg_alongside_output_bg() {
+        let input = r##"[semantic_zones]
+output_bg = "#1a1a1a"
+"##;
+        let out = zone_roundtrip(input, ZoneField::Error, Some("#3a1f1f"));
+        assert!(out.contains(r##"output_bg = "#1a1a1a""##));
+        assert!(out.contains(r##"error_bg = "#3a1f1f""##));
+    }
+
+    #[test]
+    fn removes_error_bg_keeps_other_zone_keys() {
+        let input = r##"[semantic_zones]
+output_bg = "#1a1a1a"
+error_bg = "#3a1f1f"
+"##;
+        let out = zone_roundtrip(input, ZoneField::Error, None);
+        assert!(!out.contains("error_bg"));
+        assert!(out.contains(r##"output_bg = "#1a1a1a""##));
     }
 
     #[test]

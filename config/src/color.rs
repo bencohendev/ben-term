@@ -323,6 +323,7 @@ pub struct SemanticZoneColors {
     pub input_bg: Option<RgbaColor>,
     pub output_bg: Option<RgbaColor>,
     pub prompt_bg: Option<RgbaColor>,
+    pub error_bg: Option<RgbaColor>,
 }
 impl_lua_conversion_dynamic!(SemanticZoneColors);
 
@@ -332,6 +333,7 @@ impl From<SemanticZoneColors> for TermSemanticZoneColors {
             input_bg: cfg.input_bg.map(Into::into),
             output_bg: cfg.output_bg.map(Into::into),
             prompt_bg: cfg.prompt_bg.map(Into::into),
+            error_bg: cfg.error_bg.map(Into::into),
         }
     }
 }
@@ -912,6 +914,7 @@ brights = [ "#555","#f77","#7d7","#ed7","#79d","#d7d","#7dd","#fff" ]
     assert!(scheme.semantic_zones.input_bg.is_none());
     assert!(scheme.semantic_zones.output_bg.is_none());
     assert!(scheme.semantic_zones.prompt_bg.is_none());
+    assert!(scheme.semantic_zones.error_bg.is_none());
 }
 
 #[cfg(test)]
@@ -931,6 +934,32 @@ input_bg = "#2a1f1f"
         Some(RgbColor::new_8bpc(0x2a, 0x1f, 0x1f).into())
     );
     assert!(scheme.semantic_zones.output_bg.is_none());
+    assert!(scheme.semantic_zones.prompt_bg.is_none());
+    assert!(scheme.semantic_zones.error_bg.is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn test_semantic_zones_error_bg() {
+    let toml = r##"
+[colors]
+ansi = [ "#000000","#c44","#5a5","#cb4","#46b","#a4a","#3bb","#ccc" ]
+brights = [ "#555","#f77","#7d7","#ed7","#79d","#d7d","#7dd","#fff" ]
+
+[semantic_zones]
+output_bg = "#1a1a1a"
+error_bg = "#3a1f1f"
+"##;
+    let scheme = ColorSchemeFile::from_toml_str(toml).unwrap();
+    assert_eq!(
+        scheme.semantic_zones.output_bg,
+        Some(RgbColor::new_8bpc(0x1a, 0x1a, 0x1a).into())
+    );
+    assert_eq!(
+        scheme.semantic_zones.error_bg,
+        Some(RgbColor::new_8bpc(0x3a, 0x1f, 0x1f).into())
+    );
+    assert!(scheme.semantic_zones.input_bg.is_none());
     assert!(scheme.semantic_zones.prompt_bg.is_none());
 }
 

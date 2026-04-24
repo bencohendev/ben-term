@@ -49,5 +49,11 @@ bitflags! {
         /// Otherwise, the auto-detect direction is used, falling back
         /// to the direction specified by the RTL bit.
         const AUTO_DETECT_DIRECTION = 1<<8;
+
+        /// true if this line holds cells produced by a shell command that
+        /// finished with a non-zero exit code (reported via OSC 133;D).
+        /// Used by the semantic-zone renderer to paint Output cells with
+        /// an "error" tint instead of the default `output_bg`.
+        const IS_COMMAND_FAILED = 1<<9;
     }
 }
