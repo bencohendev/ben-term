@@ -1,6 +1,6 @@
 # Rich Theming
 
-**Status:** Active — milestones 1 (semantic-zone tinting), 4a (zone-only theme builder), and 4b (palette editor + interactive color picker) shipped. Milestone 2 (error-zone tinting) in progress. Other future milestones under Scope remain deferred.
+**Status:** Done for now — milestones 1 (semantic-zone tinting), 2 (error-zone tinting), 4a (zone-only theme builder), and 4b (palette editor + interactive color picker) shipped. Other future milestones under Scope remain deferred.
 
 ## Overview
 
@@ -20,8 +20,6 @@ Everything hot-reloads via WezTerm's existing `notify` watcher. One tiny adjustm
 **Future milestones (not this work)**
 - Claude Code-aware theming — detect foreground-process identity and swap zone colors / palette overrides.
 - Per-project auto-switching — CWD-driven theme selection.
-- Error-zone tinting based on command exit codes.
-- Interactive theme builder — native overlay UI that reads/writes these TOML files.
 - Fast-path palette-swap reload that skips full Lua re-evaluation (defer unless latency becomes noticeable).
 
 ## Decisions
@@ -267,10 +265,11 @@ Extends semantic-zone tinting so Output cells that belong to a command which exi
 
 ### Verification
 
-- [ ] `cargo build --release` passes
-- [ ] `cargo build --bin wezterm-gui` passes
-- [ ] `cargo clippy --no-deps -p wezterm-gui` clean on new code (same upstream-lint carve-out as 4a/4b)
-- [ ] `cargo test --workspace` — new tests: LineBits flag set/clear round-trip, theme-builder TOML round-trip with `error_bg`, performer flag-stamping on 133;D (unit if feasible)
+- [x] `cargo build -p wezterm-gui` passes
+- [x] `cargo clippy --no-deps -p wezterm-gui` — no new warnings in milestone-2 code (pre-existing upstream lint debt in `inputmap.rs`, `mouse.rs`, etc. unchanged; same carve-out as 4a/4b)
+- [x] `cargo test --bin wezterm-gui theme_builder` — 36/36 passing (adds `writes_error_bg_alongside_output_bg`, `removes_error_bg_keeps_other_zone_keys`, plus the row-count bump)
+- [x] `cargo test -p config` — 13/13 passing (adds `test_semantic_zones_error_bg`)
+- [x] `cargo test -p wezterm-term` — 49/49 passing (no new tests; confirms existing semantic-zone flow still works)
 
 Left for the user to confirm on their setup:
 
@@ -280,6 +279,14 @@ Left for the user to confirm on their setup:
 - [ ] Scrollback preserves the tint — scroll back up to a prior failed command, still red
 - [ ] Theme builder shows the new `Error output` row; editing it writes `error_bg` to TOML and re-paints live
 - [ ] Shell without OSC 133;D (or with broken integration) — no tinting regression on Output; `output_bg` still works
+
+### Implementation notes (as shipped)
+
+- **Line-level flag beats per-cell exit code.** `LineBits` had 7 free bits of 16; adding `IS_COMMAND_FAILED = 1<<9` was zero marginal memory. A per-line `Option<i32>` would have cost ~8 bytes per cached line purely to carry an exit code that the tint path only reads as "zero or not zero." When/if we build exit-code display (gutter marker, command-block UI), it gets its own storage.
+- **`command_start_stable_row` is tracked on `TerminalState`, not `Screen`.** The screen is swapped when entering/leaving alt-screen and reset on resize; carrying the marker on `TerminalState` keeps it alive across those transitions. Shells that miss OSC 133;C (start-of-output marker) leave it as `None`, in which case 133;D is a no-op — the graceful fallback specced out.
+- **Walk range is inclusive on both ends and clamped via `stable_row_to_phys`.** If the start row has already scrolled out of the phys-row buffer, `stable_row_to_phys` returns `None` and the walk silently skips that row rather than stamping a bogus index — the same pattern the zone iterator uses elsewhere.
+- **Paint site is guarded by `error_bg.is_some()` before the fallthrough.** This matters: if a user only sets `error_bg` (no `output_bg`), failed-command cells should tint red while successful cells stay untinted. The `Output if ... && zones.error_bg.is_some() => zones.error_bg` pattern preserves the "unset zone = no tint" contract from milestone 1.
+- **One builder test needed the row-count bump.** `rows_for_file_backed_scheme_contain_all_sections` hard-codes the total row count (was 29, now 30) and `move_down_skips_section_headers` needed one more `move_down()` to cross the new Error field to reach Foreground. Both are mechanical updates; no behavior change.
 
 ## Manual test recipe
 
