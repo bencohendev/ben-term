@@ -1,6 +1,6 @@
 # Rich Theming
 
-**Status:** Done for now — milestones 1 (semantic-zone tinting), 2 (error-zone tinting), 4a (zone-only theme builder), 4b (palette editor + interactive color picker), and 5 (live preview pane) shipped. Other future milestones under Scope remain deferred.
+**Status:** Active — milestones 1 (semantic-zone tinting), 2 (error-zone tinting), 4a (zone-only theme builder), 4b (palette editor + interactive color picker), and 5 (live preview pane) shipped. Milestone 6 (picker mouse input) is the current work. Other future milestones under Scope remain deferred.
 
 ## Overview
 
@@ -377,6 +377,63 @@ Left for the user to confirm on their setup:
 - **Preview width (~32 cells)** — resolved: 40 cells. See implementation notes.
 - **Cursor on the prompt line** — in the current scene the cursor sits on the *input* segment (after the `%`), not the prompt segment. `cursor_bg` paints cleanly over `input_bg` with no stacking ambiguity. Noting here in case the scene later moves the cursor onto the prompt row.
 - **Stretch: live-tint the real window** — still deferred. Scripted pane is expected to cover the common case; revisit only if user feedback surfaces a specific need.
+
+## Milestone 6 — Picker mouse input
+
+Adds click + drag to the HSV picker's SV square and hue bar. Keyboard nudges stay exactly as-is; mouse is additive. The motivation is ergonomic — sweeping hue by eye is the whole point of the picker, and arrow-by-arrow nudging is slow for coarse exploration.
+
+### Scope
+
+- **Click + drag on SV grid** — press selects (sat, val) at the cell under the cursor; drag updates continuously; release ends capture. Commit still requires Enter (matches keyboard).
+- **Click + drag on hue bar** — same model on the hue axis.
+- **Out-of-rect during drag** — clamp to the nearest edge of the captured rect. Don't snap to the opposite side.
+- **Click outside either rect** — routes through the existing click-away path: press outside the modal entirely dismisses; press inside the modal but outside the picker's sub-rects does nothing (doesn't begin capture).
+- **Preview pane** — already repaints every frame off `editing` / picker state, so it updates live during drag for free (milestone 5 invariant).
+
+**Non-goals**
+- Wheel scroll on the picker (hue scroll would be cute but isn't in scope).
+- Mouse click on row labels in the row list (keep keyboard-only selection for rows — out of scope for "picker polish").
+- Extending drag to the preview pane or the swatch in row rendering.
+
+### Decisions
+
+| Decision | Choice | Why |
+|----------|--------|-----|
+| Modal trait extension | Change `mouse_press_pixel` return type to an enum `ModalPressResult::{Passthrough, Consume, Capture}`. Add `mouse_drag_pixel(point, term_window)` and `mouse_release_pixel(point, term_window)` with default no-op impls | Existing bool return can't distinguish "consumed, don't capture" from "consumed, capture for drag." Enum keeps the three-way decision explicit. Default impls mean palette / charselect / paneselect / popup_picker don't change behavior |
+| Mouse capture state | Reuse `TermWindow::current_mouse_capture` by adding a `MouseCapture::Modal` variant | Dispatch path in `mouse_event_impl` already gates Terminal/UI capture via this enum; adding a `Modal` arm is the minimal plumb-through. No parallel capture state to keep coherent |
+| Picker rect hit-test | During `compute()`, record the SV grid's outer `RectF` and hue bar's outer `RectF` into a `RefCell<Option<PickerLayout>>` on `ThemeBuilder` | We own the element tree, so we can record rects alongside rendering without walking the computed tree. Keeps the hit-test O(1) and robust to future layout tweaks |
+| SV cell math | `sat = (x - rect.min_x) / rect.width` clamped to [0, 1], snap to nearest `SAT_STEP`. Same for `val` on y (inverted) | Matches keyboard's 16-col × 8-row grid snapping so mouse and keyboard positions stay aligned |
+| Hue cell math | `hue = ((x - rect.min_x) / rect.width) * 360`, snap to nearest `HUE_STEP` | Matches keyboard's 24-cell hue wheel |
+| Drag commit model | Drag updates state but does NOT write to file or close picker; Enter still commits | One commit idiom across mouse + keyboard. Users can mouse-pick, then fine-tune with arrows, then Enter |
+| Release behavior | Clears capture flag; does nothing else | Symmetry with keyboard: pressing a key doesn't commit either |
+| Press on row list (outside picker) | Returns `Passthrough` | Preserves the current "click outside modal = dismiss" behavior. Clicks inside the modal but outside the picker rects become no-ops — no unexpected side effects |
+
+### Files to modify
+
+| File | Change |
+|------|--------|
+| `wezterm-gui/src/termwindow/modal.rs` | Add `ModalPressResult` enum; change `mouse_press_pixel` return; add `mouse_drag_pixel` + `mouse_release_pixel` with default no-op impls |
+| `wezterm-gui/src/termwindow/mouseevent.rs` | Add `MouseCapture::Modal` variant handling; on `Press` with `Capture` result, set `current_mouse_capture = Some(MouseCapture::Modal)`; on `Move` while captured, dispatch `modal.mouse_drag_pixel`; on `Release` while captured, dispatch `modal.mouse_release_pixel` + clear |
+| `wezterm-gui/src/overlay/context_dropdowns/popup_picker.rs` | Migrate `mouse_press_pixel` return to `ModalPressResult` (existing behavior maps to `Consume` / `Passthrough`) |
+| `wezterm-gui/src/overlay/theme_builder/builder.rs` | Add `picker_layout: RefCell<Option<PickerLayout>>`; populate during `compute()` when picker is open; implement `mouse_press_pixel` with SV/hue hit-testing; implement `mouse_drag_pixel` + `mouse_release_pixel` |
+| `wezterm-gui/src/overlay/theme_builder/picker.rs` | New `PickerLayout { sv_rect: RectF, hue_rect: RectF }`; new `sv_point_to_state` + `hue_point_to_state` helpers; keep keyboard path unchanged |
+
+### Verification
+
+- `cargo build --bin wezterm-gui` passes
+- `cargo clippy --no-deps -p wezterm-gui` — no new warnings in picker / modal code
+- `cargo test --bin wezterm-gui theme_builder` — new: SV-rect hit-test, hue-rect hit-test, out-of-rect clamp, drag continues updating when moved outside rect, press outside both rects returns `Passthrough`
+- `cargo test -p wezterm-gui` — existing modals (palette/charselect/paneselect/popup_picker) still compile and behave under the new `ModalPressResult` signature
+
+Left for the user to confirm on their setup:
+
+- Open picker on a file-backed scheme; click inside SV grid → cursor jumps to that cell, preview pane reflects it
+- Drag within SV → cursor follows; preview updates every frame
+- Drag outside SV bounds → clamps to edge, doesn't jump
+- Click inside hue bar → hue updates; click-drag across hue bar works
+- Click inside the row list (outside picker rects) → no effect; no ghost row-edit triggers
+- Click outside the modal entirely → modal dismisses (click-away unchanged)
+- After mouse picks, arrow-nudge keyboard still works from the new (hue, sat, val); Enter commits
 
 ## Manual test recipe
 
