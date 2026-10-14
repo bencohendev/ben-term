@@ -37,18 +37,19 @@ ben-term/
 | Feature | Spec | Description |
 |---------|------|-------------|
 | WezTerm core | (upstream) | Full terminal emulator: PTY, VT parsing, GPU rendering, tabs, panes, fonts, config |
+| Git picker | [features/git-picker.md](features/git-picker.md) | `git <sub>` + Space dropdown. Phases 1–5 shipped (refs, stash, files, remotes, commits) |
 
 ## Active Features
 
 | Feature | Spec | Description |
 |---------|------|-------------|
-| Context dropdowns | [features/context-dropdowns.md](features/context-dropdowns.md) | Native overlay pickers for cd, git checkout/stash, npm run/cargo, ssh, docker, kill, env — triggered by command + space. v1 in progress: `cd` only |
+| Context dropdowns | [features/context-dropdowns.md](features/context-dropdowns.md) | Shared infra (popup shell, trigger helpers) + `cd` picker. v1/v2/v3 shipped (incl. click-away, flip-above) |
+| Rich theming | [features/rich-theming.md](features/rich-theming.md) | TOML `[semantic_zones]` section tints cell backgrounds by OSC 133 zone. Milestones 1 + 2 + 4a + 4b + 5 shipped; milestone 6 (picker mouse input) in flight |
 
 ## Planned Features
 
 | Feature | Description |
 |---------|-------------|
-| Rich theming | Semantic zones (input/output/error tinting), Claude Code-aware themes, per-project auto-switching, hot-reloadable CSS-like config layer |
 | Rich search history | Directory-aware filtering, exit code tracking, timestamps + duration, output preview snippets, frecent ranking |
 | Workspaces & layouts | Named workspaces with pre-configured tab/split layouts, layout persistence across restarts, project-aware tab grouping |
 | Command blocks | Visually group each command + output as a discrete unit — collapsible, copyable, re-runnable |
@@ -56,6 +57,8 @@ ben-term/
 | Smart notifications | System notification when a long-running command finishes in a background tab |
 | Inline images | Polish existing iTerm2/Kitty image protocol support for matplotlib, image previews, etc. |
 | Shell integration hooks | ZLE widgets and precmd/preexec hooks for structured shell-to-terminal communication |
+| Platform keyboard parity | System-convention keybindings across the board (e.g. macOS: cmd+delete → delete to line start, option+delete → delete word, cmd+arrow word-jumps, etc.) |
+| Recent-commands popup | Up-arrow opens a popup listing the most recent shell commands for quick re-run; can ride on the context-dropdowns PopupPicker infra with a history-based gather |
 
 ## Bugs
 

@@ -1,4 +1,5 @@
 use crate::tabbar::TabBarItem;
+use crate::termwindow::modal::ModalPressResult;
 use crate::termwindow::{
     GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
 };
@@ -66,6 +67,55 @@ impl super::TermWindow {
         };
 
         self.current_mouse_event.replace(event.clone());
+
+        // Give the active modal first crack at mouse events. Three paths:
+        //
+        // 1. Press: dispatch to `mouse_press_pixel`. `Consume` swallows the
+        //    event (used by popup pickers for click-away dismiss). `Capture`
+        //    additionally installs `MouseCapture::Modal` so subsequent
+        //    motion and release events route to the modal's drag/release
+        //    hooks (used by the theme-builder HSV picker).
+        // 2. Move while captured: dispatch to `mouse_drag_pixel` and stop.
+        //    The normal UI-item / terminal-pane dispatch is skipped.
+        // 3. Release while captured: dispatch to `mouse_release_pixel`,
+        //    clear the capture, and stop. Normal dispatch is skipped.
+        //
+        // A modal that never returns `Capture` from its press hook never
+        // exercises paths 2 or 3, so upstream modals stay on defaults.
+        match event.kind {
+            WMEK::Press(_) => {
+                if let Some(modal) = self.get_modal() {
+                    let pt = (event.coords.x as f32, event.coords.y as f32);
+                    match modal.mouse_press_pixel(pt, self) {
+                        ModalPressResult::Passthrough => {}
+                        ModalPressResult::Consume => return,
+                        ModalPressResult::Capture => {
+                            self.current_mouse_capture = Some(MouseCapture::Modal);
+                            return;
+                        }
+                    }
+                }
+            }
+            WMEK::Move if matches!(self.current_mouse_capture, Some(MouseCapture::Modal)) => {
+                if let Some(modal) = self.get_modal() {
+                    let pt = (event.coords.x as f32, event.coords.y as f32);
+                    modal.mouse_drag_pixel(pt, self);
+                    context.invalidate();
+                } else {
+                    self.current_mouse_capture = None;
+                }
+                return;
+            }
+            WMEK::Release(_) if matches!(self.current_mouse_capture, Some(MouseCapture::Modal)) => {
+                if let Some(modal) = self.get_modal() {
+                    let pt = (event.coords.x as f32, event.coords.y as f32);
+                    modal.mouse_release_pixel(pt, self);
+                }
+                self.current_mouse_capture = None;
+                return;
+            }
+            _ => {}
+        }
 
         let border = self.get_os_border();
 

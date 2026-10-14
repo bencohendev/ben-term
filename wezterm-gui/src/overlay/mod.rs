@@ -8,12 +8,14 @@ use wezterm_term::{TerminalConfiguration, TerminalSize};
 
 pub mod confirm;
 pub mod confirm_close_pane;
+pub mod context_dropdowns;
 pub mod copy;
 pub mod debug;
 pub mod launcher;
 pub mod prompt;
 pub mod quickselect;
 pub mod selector;
+pub mod theme_builder;
 
 pub use confirm_close_pane::{
     confirm_close_pane, confirm_close_tab, confirm_close_window, confirm_quit_program,

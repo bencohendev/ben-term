@@ -364,6 +364,22 @@ impl Line {
         self.update_last_change_seqno(seqno);
     }
 
+    /// True if this line has been marked as belonging to a shell command
+    /// that exited with a non-zero status (OSC 133;D).
+    #[inline]
+    pub fn is_command_failed(&self) -> bool {
+        self.bits.contains(LineBits::IS_COMMAND_FAILED)
+    }
+
+    /// Set or clear the "failed command" marker. The semantic-zone
+    /// renderer uses this to pick `error_bg` over `output_bg` when
+    /// tinting Output cells.
+    #[inline]
+    pub fn set_command_failed(&mut self, failed: bool, seqno: SequenceNo) {
+        self.bits.set(LineBits::IS_COMMAND_FAILED, failed);
+        self.update_last_change_seqno(seqno);
+    }
+
     /// Set a flag the indicate whether the line should have the bidi
     /// algorithm applied during rendering
     pub fn set_bidi_enabled(&mut self, enabled: bool, seqno: SequenceNo) {

@@ -114,6 +114,30 @@ impl InputMap {
                 ],
                 [
                     MouseEventTriggerMods {
+                        mods: Modifiers::CTRL,
+                        mouse_reporting: false,
+                        alt_screen: MouseEventAltScreen::Any,
+                    },
+                    MouseEventTrigger::Down {
+                        streak: 1,
+                        button: MouseButton::WheelUp(1),
+                    },
+                    IncreaseFontSize
+                ],
+                [
+                    MouseEventTriggerMods {
+                        mods: Modifiers::CTRL,
+                        mouse_reporting: false,
+                        alt_screen: MouseEventAltScreen::Any,
+                    },
+                    MouseEventTrigger::Down {
+                        streak: 1,
+                        button: MouseButton::WheelDown(1),
+                    },
+                    DecreaseFontSize
+                ],
+                [
+                    MouseEventTriggerMods {
                         mods: Modifiers::NONE,
                         mouse_reporting: false,
                         alt_screen: MouseEventAltScreen::Any,

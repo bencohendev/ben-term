@@ -111,6 +111,11 @@ pub fn get_window_class() -> String {
 pub enum MouseCapture {
     UI,
     TerminalPane(PaneId),
+    /// The active modal has captured the mouse following a press whose
+    /// `mouse_press_pixel` returned `ModalPressResult::Capture`. Motion
+    /// and release route to the modal's drag/release hooks until the
+    /// button comes up. Used by the theme builder's HSV picker.
+    Modal,
 }
 
 /// Type used together with Window::notify to do something in the
@@ -369,7 +374,10 @@ pub struct TermWindow {
     os_parameters: Option<parameters::Parameters>,
     /// When we most recently received keyboard focus
     pub focused: Option<Instant>,
-    fonts: Rc<FontConfiguration>,
+    // NOTE: made `pub` so `Modal` implementations outside the `termwindow`
+    // module (ben-term custom context dropdowns) can read them with the same
+    // access that upstream modals (palette/charselect/paneselect) enjoy.
+    pub fonts: Rc<FontConfiguration>,
     /// Window dimensions and dpi
     pub dimensions: Dimensions,
     pub window_state: WindowState,
@@ -381,13 +389,13 @@ pub struct TermWindow {
     pub mux_window_id: MuxWindowId,
     pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
     pub render_metrics: RenderMetrics,
-    render_state: Option<RenderState>,
+    pub render_state: Option<RenderState>,
     input_map: InputMap,
     /// If is_some, the LEADER modifier is active until the specified instant.
     leader_is_down: Option<std::time::Instant>,
     dead_key_status: DeadKeyStatus,
     key_table_state: KeyTableState,
-    show_tab_bar: bool,
+    pub show_tab_bar: bool,
     show_scroll_bar: bool,
     tab_bar: TabBarState,
     fancy_tab_bar: Option<box_model::ComputedElement>,
@@ -1841,7 +1849,9 @@ impl TermWindow {
         self.emit_window_event("window-config-reloaded", None);
     }
 
-    fn invalidate_modal(&mut self) {
+    // NOTE: `pub` so `Modal` implementations outside the `termwindow` module
+    // (ben-term context dropdowns) can request relayout after handling a key.
+    pub fn invalidate_modal(&mut self) {
         if let Some(modal) = self.get_modal() {
             modal.reconfigure(self);
             if let Some(window) = self.window.as_ref() {
@@ -1864,8 +1874,25 @@ impl TermWindow {
         }
     }
 
-    fn get_modal(&self) -> Option<Rc<dyn Modal>> {
+    // NOTE: `pub` so async background loaders (ben-term context dropdowns)
+    // can locate the currently-installed modal on the main thread and
+    // downcast to the concrete picker type to push in deferred results.
+    pub fn get_modal(&self) -> Option<Rc<dyn Modal>> {
         self.modal.borrow().as_ref().map(|m| Rc::clone(&m))
+    }
+
+    /// Whether a `Modal` popup is currently installed for this window.
+    /// Exposed for the context-dropdown trigger guard chain, which must not
+    /// fire Space-activated pickers on top of an existing modal.
+    pub fn has_modal(&self) -> bool {
+        self.modal.borrow().is_some()
+    }
+
+    /// Current terminal grid size (cols / rows / pixels / dpi).
+    /// Exposed so custom popups outside the `termwindow` module can size
+    /// themselves relative to the terminal.
+    pub fn terminal_size(&self) -> TerminalSize {
+        self.terminal_size
     }
 
     fn update_scrollbar(&mut self) {
@@ -3159,9 +3186,29 @@ impl TermWindow {
                 let modal = crate::termwindow::palette::CommandPalette::new(self);
                 self.set_modal(Rc::new(modal));
             }
+            ActivateThemeBuilder => {
+                crate::overlay::theme_builder::try_activate(self);
+            }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
             Confirmation(args) => self.show_confirmation(args),
+            ActivateContextDropdown(kind) => {
+                use crate::overlay::context_dropdowns::{cd, git, TriggerResult};
+                use config::keyassignment::ContextDropdownKind;
+                // The `Cd` variant is historical — it's the "try each of our
+                // context pickers in order" dispatch. Chain cd → git → future
+                // phases (stash, files, remotes) as they land.
+                let result = match kind {
+                    ContextDropdownKind::Cd => match cd::try_activate(self, pane) {
+                        TriggerResult::Launched => TriggerResult::Launched,
+                        TriggerResult::PassThrough => git::try_activate(self, pane),
+                    },
+                };
+                return Ok(match result {
+                    TriggerResult::Launched => PerformAssignmentResult::Handled,
+                    TriggerResult::PassThrough => PerformAssignmentResult::Unhandled,
+                });
+            }
         };
         Ok(PerformAssignmentResult::Handled)
     }
@@ -3384,6 +3431,13 @@ impl TermWindow {
         let mux = Mux::get();
         mux.get_active_tab_for_window(self.mux_window_id)
             .and_then(|tab| tab.get_active_pane())
+    }
+
+    /// ben-term: helper for context dropdowns to short-circuit when the pane
+    /// already has an overlay mounted (e.g. the picker itself). See
+    /// `overlay/context_dropdowns/`.
+    pub fn pane_has_overlay(&self, pane_id: PaneId) -> bool {
+        self.pane_state(pane_id).overlay.is_some()
     }
 
     /// Returns a Pane that we can interact with; this will typically be

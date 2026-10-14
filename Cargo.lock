@@ -6932,6 +6932,7 @@ dependencies = [
  "textwrap",
  "thiserror 1.0.69",
  "tiny-skia",
+ "toml_edit 0.22.27",
  "umask",
  "unicode-normalization",
  "unicode-segmentation",

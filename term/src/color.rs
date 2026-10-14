@@ -43,6 +43,20 @@ impl std::iter::FromIterator<SrgbaTuple> for Palette256 {
     }
 }
 
+/// Background tints applied per semantic-zone (OSC 133) region.
+/// `None` means "no tint for this zone" — absent sections are inert.
+#[derive(Clone, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+pub struct SemanticZoneColors {
+    pub input_bg: Option<SrgbaTuple>,
+    pub output_bg: Option<SrgbaTuple>,
+    pub prompt_bg: Option<SrgbaTuple>,
+    /// Tint for Output cells belonging to a command that exited non-zero
+    /// (reported via OSC 133;D). When unset, failed-command output paints
+    /// `output_bg` as usual.
+    pub error_bg: Option<SrgbaTuple>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct ColorPalette {
@@ -56,6 +70,7 @@ pub struct ColorPalette {
     pub selection_bg: SrgbaTuple,
     pub scrollbar_thumb: SrgbaTuple,
     pub split: SrgbaTuple,
+    pub semantic_zones: SemanticZoneColors,
 }
 
 impl fmt::Debug for Palette256 {
@@ -188,6 +203,7 @@ impl ColorPalette {
             selection_bg,
             scrollbar_thumb,
             split,
+            semantic_zones: SemanticZoneColors::default(),
         }
     }
 }
