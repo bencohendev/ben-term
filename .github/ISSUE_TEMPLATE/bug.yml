@@ -1,6 +1,7 @@
 name: Bug Report Form
 description: Create a report to help us improve
 labels: [bug, needs:triage]
+projects: ["bencohendev/1"]
 assignees: []
 body:
   - type: dropdown
