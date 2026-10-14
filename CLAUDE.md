@@ -35,28 +35,11 @@ After adding, modifying, or fixing features, run these checks:
 
 ## Feature Workflow
 
-### 1. Pick Work
-- Use `/find-work` to surface available items
-- User selects what to work on
+Run `/work-on <#>` (`/find-work` to pick, `/add-work` to file). It sets the Issue Active on the Active Work board, works in a worktree off `main`, runs the fast verify (`cargo check`, `cargo clippy`), and opens a PR with `Closes #N`, then stops for review. See `.readme/WORKFLOW.md`. Rules specific to this repo:
 
-### 2. Mark as Active
-- Set the feature spec's `**Status:**` to `Active` (create the spec first if it doesn't exist)
-- Commit the status change before starting implementation
-
-### 3. Ensure a Spec Exists
-- **If a spec exists:** read it, confirm scope with the user, then begin implementation
-- **If no spec exists:** create one in `.readme/features/`, add to `index.md`, get user approval, then begin
-
-### 4. Implement
-- Enter a worktree, implement, and verify
-- Run all checks (build, clippy, tests) before finishing
-
-### 5. Verify
-- Run `/verify` — all checks must pass before proceeding
-
-### 6. Document
-- Run `/update-docs` — audit and update all documentation layers
-- Commit doc updates and merge to `main`
+- **Specs:** features get a spec in `.readme/features/` with `**Issue:** #N`. If none exists, write it and get the user's approval before implementing.
+- **Full checks:** for non-trivial changes, run `/verify` (`cargo build --release`, `cargo test --workspace`) before the PR.
+- **Docs:** run `/update-docs` before the PR.
 
 ## Documentation
 

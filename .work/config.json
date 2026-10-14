@@ -1,10 +1,11 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "repoOwner": "bencohendev",
   "repo": "ben-term",
-  "repoUrl": "https://github.com/bencohendev/ben-term",
+  "defaultBranch": "main",
   "projectOwner": "bencohendev",
   "projectNumber": 1,
+  "projectTitle": "Active Work",
   "projectId": "PVT_kwHOA48Tqc4BVm67",
   "statusFieldId": "PVTSSF_lAHOA48Tqc4BVm67zhRBmxg",
   "statusOptions": {
@@ -14,17 +15,10 @@
     "Done": "f56f81c9",
     "Deferred": "7383f5f9"
   },
-  "defaultStatus": "Planned",
-  "trackedLabel": "tracked",
   "adrDir": "docs/decisions",
-  "adrTemplate": "docs/decisions/_template.md",
   "verifyCommands": [
     "cargo check --workspace",
     "cargo clippy --workspace -- -D warnings"
   ],
-  "requireVerifyBeforeFinish": true,
-  "closeIssueOnFinish": true,
-  "refreshRepoMapOnFinish": true,
-  "branchPrefix": "issue-",
-  "defaultBranch": "main"
+  "branchPrefix": "issue-"
 }
